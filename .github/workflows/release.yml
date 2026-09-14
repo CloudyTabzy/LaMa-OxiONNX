@@ -13,7 +13,7 @@ jobs:
     runs-on: windows-latest
     steps:
       - name: Checkout
-        uses: actions/checkout@v4
+        uses: actions/checkout@v5
 
       - name: Rust toolchain
         uses: dtolnay/rust-toolchain@stable
@@ -54,3 +54,15 @@ jobs:
             "SHA256SUMS.txt" `
             --title "LaMa OxiONNX $tag" `
             --generate-notes
+
+      - name: Prepend install header to the release notes
+        shell: pwsh
+        env:
+          GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+        run: |
+          $tag = $env:GITHUB_REF_NAME
+          $sha = ((Get-Content SHA256SUMS.txt) -split '\s+')[1]
+          $header = (Get-Content docs/RELEASE_HEADER.md -Raw).Replace('{{TAG}}', $tag).Replace('{{SHA256}}', $sha)
+          $body = gh release view $tag --json body -q .body
+          "$header`n---`n`n$body" | Set-Content -Encoding utf8 -NoNewline notes.md
+          gh release edit $tag --notes-file notes.md
