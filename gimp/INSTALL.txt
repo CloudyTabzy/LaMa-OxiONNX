@@ -27,9 +27,9 @@ Notes
   - No session cache is used by default. Setting OXIONNX_SESSION_CACHE=1
     enables a ~373 MB cache next to the model that saves about 0.1 s per
     run; it is not needed.
-  - Status log with a per-run phase profile (export / worker / inference /
-    import / apply):
-      %APPDATA%\GIMP\3.2\plug-ins\lama-oxionnx\lama.log
+  - Error log: %APPDATA%\GIMP\3.2\plug-ins\lama-oxionnx\lama.log
+    (a successful run does not write to it; set LAMA_OXIONNX_LOG=1 before
+    starting GIMP to also record the per-run phase profile)
   - Uninstall: delete %APPDATA%\GIMP\3.2\plug-ins\lama-oxionnx\ and the
     lama-oxionnx-gimp-python*.interp files under
     %APPDATA%\GIMP\3.2\interpreters\.

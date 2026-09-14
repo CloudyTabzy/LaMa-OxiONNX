@@ -92,24 +92,25 @@ Either way the installer:
 
 Restart GIMP, make a selection, and run
 **Filters → Enhance → LaMa Inpaint (OxiONNX)...**. No session cache is used
-by default: the model is parsed and optimized on the spot (~0.4 s; the
+by default — the model is parsed and optimized on the spot (~0.4 s; the
 optional `OXIONNX_SESSION_CACHE=1` cache saves only ~0.1 s for 373 MB of
-disk, so most users should skip it). Status is logged to
-`plug-ins\lama-oxionnx\lama.log`, with a per-run phase profile (drawable
+disk). Errors are logged to `plug-ins\lama-oxionnx\lama.log`; set
+`LAMA_OXIONNX_LOG=1` to also record the per-run phase profile (drawable
 export, worker wall time, inference, result import, shadow merge) — see
-[gimp/README.md](gimp/README.md#log-and-per-run-profiling).
+[gimp/README.md](gimp/README.md#logging-and-per-run-profiling).
 `gimp\gimp-verbose.bat` launches GIMP with a console and prints the log
 afterwards.
 
 The installer is non-destructive: the ONNX Runtime plug-in in
 `plug-ins\lama-inpaint` keeps working untouched.
 
-Two environment overrides, both optional:
+Three environment overrides, all optional:
 
 | Variable | Effect |
 |---|---|
 | `LAMA_OXIONNX_WORKER` | Use a development build of the worker instead of the installed one |
 | `LAMA_OXIONNX_MAX_PIXELS` | Override the 4 MP guard (the worker has no ROI path yet; see [Roadmap](#-roadmap)) |
+| `LAMA_OXIONNX_LOG=1` | Also log per-run `worker:`/`profile:` lines (errors are always logged; off by default) |
 
 ## 📊 Benchmarks
 

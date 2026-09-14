@@ -79,6 +79,7 @@ on first run. Do not add it to release assets.
    the plug-in (or after removing `plug-ins\lama-oxionnx\` and the
    `lama-oxionnx-gimp-python*.interp` files).
 2. Unzip, run `install.bat`, restart GIMP, run the filter on a photo.
-3. Check `lama.log` shows the per-run `profile:` lines and the result is
+3. Check `lama.log` shows the per-run `profile:` lines (with
+   `LAMA_OXIONNX_LOG=1` set — errors are always logged) and the result is
    inpainted content (not white — see the report's §10 for what that
    looked like when it went wrong).

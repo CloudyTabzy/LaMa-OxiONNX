@@ -40,12 +40,14 @@ then restart GIMP and use **Filters → Enhance → LaMa Inpaint (OxiONNX)...**.
 | `LAMA_OXIONNX_MAX_PIXELS` | override the 4 MP native-resolution guard (default 4,000,000) |
 | `OXIONNX_SESSION_CACHE=1` | enable the worker's optional ~373 MB session cache (set before GIMP starts; the worker inherits it — off by default, saves ~0.1 s/run) |
 
-## Log and per-run profiling
+## Logging and per-run profiling
 
-The plug-in writes a rotating 200-line log to `lama.log` next to itself
-(`%APPDATA%\GIMP\3.2\plug-ins\lama-oxionnx\lama.log`). Every successful run
-adds a `worker:` line plus two `profile:` lines that account for the whole
-round trip:
+Errors are always logged to a rotating 200-line `lama.log` next to the
+plug-in (`%APPDATA%\GIMP\3.2\plug-ins\lama-oxionnx\lama.log`); a successful
+run leaves the file untouched. To record the per-run phase profile as well,
+set `LAMA_OXIONNX_LOG=1` before starting GIMP. With it enabled, every
+successful run adds a `worker:` line plus two `profile:` lines that account
+for the whole round trip:
 
 ```
 [00:02:56] profile: worker decode_ms=18 preprocess_ms=1 load_ms=305 run_ms=8886 compose_ms=5 write_ms=9 total_ms=9227

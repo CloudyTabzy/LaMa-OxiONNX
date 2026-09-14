@@ -96,6 +96,26 @@ def _log(msg):
         pass
 
 
+def _env_truthy(name):
+    """Return True iff the named env var is set to a truthy string."""
+    value = os.environ.get(name)
+    if value is None:
+        return False
+    return value.strip().lower() not in ("", "0", "false", "no", "off")
+
+
+# Per-run logging is opt-in: LAMA_OXIONNX_LOG=1. Errors are always logged;
+# routine lines (worker path, per-run phase profile) only when asked for, so
+# a successful inference leaves no trace on disk.
+_VERBOSE_LOG = _env_truthy("LAMA_OXIONNX_LOG")
+
+
+def _vlog(msg):
+    """Log a routine per-run line only when ``LAMA_OXIONNX_LOG`` is set."""
+    if _VERBOSE_LOG:
+        _log(msg)
+
+
 def _normalize_path(path):
     if not isinstance(path, str) or not path.strip():
         return None
@@ -557,7 +577,7 @@ class LamaOxiONNX(Gimp.PlugIn):
                     ]
 
                     _phase("Starting LaMa worker...", 0.30)
-                    _log(f"worker: {worker_binary}")
+                    _vlog(f"worker: {worker_binary}")
 
                     try:
                         t = time.monotonic()
@@ -596,7 +616,7 @@ class LamaOxiONNX(Gimp.PlugIn):
                     timing_line = None
                     for line in (completed.stdout or "").splitlines():
                         if "[LAMA_MARKER] profile" in line:
-                            _log(
+                            _vlog(
                                 "profile: worker "
                                 + line.split("profile", 1)[1].strip()
                             )
@@ -605,7 +625,7 @@ class LamaOxiONNX(Gimp.PlugIn):
                             timing_line = line.strip()
                     else:
                         if timing_line:
-                            _log(timing_line)
+                            _vlog(timing_line)
 
                     # Optional debug copies: keeps the exact PNGs exchanged
                     # with the worker so the pipeline can be inspected
@@ -623,9 +643,9 @@ class LamaOxiONNX(Gimp.PlugIn):
                                     shutil.copyfile(
                                         src_path, os.path.join(debug_dir, name)
                                     )
-                            _log(f"debug copies written to {debug_dir}")
+                            _vlog(f"debug copies written to {debug_dir}")
                         except OSError as exc:
-                            _log(f"debug copy failed: {exc}")
+                            _vlog(f"debug copy failed: {exc}")
 
                     _phase("Applying result...", 0.90)
                     t = time.monotonic()
@@ -643,7 +663,7 @@ class LamaOxiONNX(Gimp.PlugIn):
                 Gimp.displays_flush()
                 apply_ms = int((time.monotonic() - t) * 1000)
 
-                _log(
+                _vlog(
                     "profile: bridge export_ms=%d mask_ms=%d worker_wall_ms=%d "
                     "import_ms=%d apply_ms=%d total_ms=%d"
                     % (
