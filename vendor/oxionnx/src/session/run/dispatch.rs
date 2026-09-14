@@ -34,7 +34,9 @@ impl Session {
         let can_slot = !can_inplace && operator.supports_output_slots();
 
         if can_slot {
-            if let Some(mut slots) = Self::acquire_output_slots(node, resolved_shapes, pool) {
+            if let Some(mut slots) =
+                Self::acquire_output_slots(node, resolved_shapes, pool, operator.fully_writes_slots())
+            {
                 let resolved_inputs: Vec<Option<&Tensor>> = node
                     .inputs
                     .iter()
@@ -200,15 +202,16 @@ impl Session {
     /// inherit the previous tensor's values in the elements it skips.  That is a
     /// wrong-numbers bug, not a crash.
     ///
-    /// Routing this call site therefore waits on a `fully_writes_slots()`
-    /// predicate on `oxionnx_core::Operator` (defaulting to `false`, so the
-    /// zeroing path stays the default for every existing operator), which is a
-    /// change to the trait rather than to the engine.  Until it exists, the safe
-    /// answer is the one the pool has always given.
+    /// Routing this call site goes through the `fully_writes_slots()` predicate
+    /// on `oxionnx_core::Operator` (default `false`, so the zeroing path stays
+    /// the default for every operator that has not opted in — a partially
+    /// writing operator that opted in wrongly would silently inherit the
+    /// previous tensor's values in the elements it skips).
     pub(super) fn acquire_output_slots(
         node: &Node,
         resolved_shapes: &HashMap<String, Vec<usize>>,
         pool: Option<&Mutex<SizeClassPool>>,
+        fully_writes: bool,
     ) -> Option<Vec<Tensor>> {
         let mut guard = pool.and_then(|pool_mutex| pool_mutex.lock().ok());
         let mut slots = Vec::with_capacity(node.outputs.len());
@@ -246,7 +249,13 @@ impl Session {
                 shape.iter().product()
             };
             let data = match guard.as_mut() {
-                Some(pool_guard) => pool_guard.acquire(size),
+                Some(pool_guard) => {
+                    if fully_writes {
+                        pool_guard.acquire_for_overwrite(size)
+                    } else {
+                        pool_guard.acquire(size)
+                    }
+                }
                 None => vec![0.0f32; size],
             };
             slots.push(Tensor::new(data, shape.clone()));

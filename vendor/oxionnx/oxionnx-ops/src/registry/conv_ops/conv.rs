@@ -160,6 +160,9 @@ impl Operator for ConvOp {
     fn op_type(&self) -> &str {
         "Conv"
     }
+    fn fully_writes_slots(&self) -> bool {
+        true
+    }
     fn execute(&self, ctx: &OpContext<'_>) -> Result<Vec<Tensor>, OnnxError> {
         let input = ctx.input(0)?;
         let weight = ctx.input(1)?;
@@ -557,6 +560,9 @@ pub struct ConvTransposeOp;
 impl Operator for ConvTransposeOp {
     fn op_type(&self) -> &str {
         "ConvTranspose"
+    }
+    fn fully_writes_slots(&self) -> bool {
+        true
     }
     fn execute(&self, ctx: &OpContext<'_>) -> Result<Vec<Tensor>, OnnxError> {
         let input = ctx.input(0)?;

@@ -399,6 +399,9 @@ impl Operator for CastOp {
     fn op_type(&self) -> &str {
         "Cast"
     }
+    fn fully_writes_slots(&self) -> bool {
+        true
+    }
     fn execute(&self, ctx: &OpContext<'_>) -> Result<Vec<Tensor>, OnnxError> {
         let x = ctx.input(0)?;
         let to = ctx.attrs().i("to", 1);

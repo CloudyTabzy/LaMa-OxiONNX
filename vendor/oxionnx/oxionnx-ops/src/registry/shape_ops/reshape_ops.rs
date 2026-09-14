@@ -11,6 +11,9 @@ impl Operator for ReshapeOp {
     fn op_type(&self) -> &str {
         "Reshape"
     }
+    fn fully_writes_slots(&self) -> bool {
+        true
+    }
     fn execute(&self, ctx: &OpContext<'_>) -> Result<Vec<Tensor>, OnnxError> {
         let x = ctx.input(0)?;
         let shape_t = ctx.input(1)?;
@@ -63,6 +66,23 @@ impl Operator for ReshapeOp {
         out.shape = new_shape;
         Ok(vec![out])
     }
+    fn supports_inplace(&self) -> bool {
+        true
+    }
+    fn execute_inplace(
+        &self,
+        mut input: Tensor,
+        ctx: &OpContext<'_>,
+    ) -> Result<Vec<Tensor>, OnnxError> {
+        // Reshape is a pure metadata change: the element order is untouched, so
+        // the owned buffer is reused and only the shape is swapped.
+        let shape_t = ctx.input(1)?;
+        let allowzero = ctx.attrs().i("allowzero", 0) != 0;
+        let s: Vec<i64> = shape_t.data.iter().map(|&v| v as i64).collect();
+        input.shape = shape::resolve_reshape(&input.shape, input.numel(), &s, allowzero)
+            .map_err(OnnxError::ShapeMismatch)?;
+        Ok(vec![input])
+    }
     fn supports_output_slots(&self) -> bool {
         true
     }
@@ -78,13 +98,16 @@ impl Operator for ReshapeOp {
         let shape_t = ctx.input(1)?;
         let allowzero = ctx.attrs().i("allowzero", 0) != 0;
         let s: Vec<i64> = shape_t.data.iter().map(|&v| v as i64).collect();
-        let result = shape::reshape(x, &s, allowzero)?;
+        // Resolve the shape directly instead of building a throwaway tensor via
+        // `shape::reshape` and copying it into the slot afterwards: one copy, not two.
+        let new_shape = shape::resolve_reshape(&x.shape, x.numel(), &s, allowzero)
+            .map_err(OnnxError::ShapeMismatch)?;
         let out = &mut slots[0];
-        if out.shape == result.shape && out.data.len() == result.data.len() {
-            out.data.copy_from_slice(&result.data);
-        } else {
-            *out = result;
+        if out.data.len() != x.data.len() {
+            out.data.resize(x.data.len(), 0.0_f32);
         }
+        out.data.copy_from_slice(&x.data);
+        out.shape = new_shape;
         Ok(())
     }
 }
@@ -95,6 +118,9 @@ pub struct TransposeOp;
 impl Operator for TransposeOp {
     fn op_type(&self) -> &str {
         "Transpose"
+    }
+    fn fully_writes_slots(&self) -> bool {
+        true
     }
     fn execute(&self, ctx: &OpContext<'_>) -> Result<Vec<Tensor>, OnnxError> {
         let x = ctx.input(0)?;
@@ -119,6 +145,38 @@ impl Operator for TransposeOp {
     fn supports_output_slots(&self) -> bool {
         true
     }
+    fn execute_into_slots(
+        &self,
+        ctx: &OpContext<'_>,
+        slots: &mut [Tensor],
+    ) -> Result<(), OnnxError> {
+        if slots.is_empty() {
+            return Ok(());
+        }
+        let x = ctx.input(0)?;
+        let ndim = x.ndim();
+        let raw_perm = ctx.attrs().ints("perm");
+        // Validate before casting: a raw negative i64 cast straight to `usize` wraps to a huge
+        // value, which then indexes `x.shape`/`in_strides` out of bounds inside `shape::transpose`.
+        let perm: Vec<usize> = raw_perm
+            .iter()
+            .map(|&v| {
+                if v < 0 || v >= ndim as i64 {
+                    Err(OnnxError::ShapeMismatch(format!(
+                        "Transpose: perm entry {v} out of range for {ndim}D tensor"
+                    )))
+                } else {
+                    Ok(v as usize)
+                }
+            })
+            .collect::<Result<_, _>>()?;
+        // Written straight into the slot; the default slot path would build
+        // an intermediate tensor and copy it in as well.
+        let out_shape = crate::shape::basic::transpose_into(x, &perm, &mut slots[0].data)
+            .map_err(OnnxError::ShapeMismatch)?;
+        slots[0].shape = out_shape;
+        Ok(())
+    }
 }
 
 // ── Squeeze ──────────────────────────────────────────────────────────────────
@@ -128,6 +186,9 @@ impl Operator for SqueezeOp {
     fn op_type(&self) -> &str {
         "Squeeze"
     }
+    fn fully_writes_slots(&self) -> bool {
+        true
+    }
     fn execute(&self, ctx: &OpContext<'_>) -> Result<Vec<Tensor>, OnnxError> {
         let x = ctx.input(0)?;
         let axes = if let Some(t) = ctx.optional_input(1) {
@@ -136,6 +197,23 @@ impl Operator for SqueezeOp {
             ctx.attrs().ints("axes").to_vec()
         };
         Ok(vec![shape::squeeze(x, &axes)?])
+    }
+    fn supports_inplace(&self) -> bool {
+        true
+    }
+    fn execute_inplace(
+        &self,
+        mut input: Tensor,
+        ctx: &OpContext<'_>,
+    ) -> Result<Vec<Tensor>, OnnxError> {
+        // Metadata-only: dropping 1-sized axes does not move any element.
+        let raw_axes: Vec<i64> = if let Some(t) = ctx.optional_input(1) {
+            t.data.iter().map(|&v| v as i64).collect()
+        } else {
+            ctx.attrs().ints("axes").to_vec()
+        };
+        input.shape = shape::basic::resolve_squeeze_shape(&input.shape, &raw_axes)?;
+        Ok(vec![input])
     }
     fn supports_output_slots(&self) -> bool {
         true
@@ -174,6 +252,9 @@ impl Operator for UnsqueezeOp {
     fn op_type(&self) -> &str {
         "Unsqueeze"
     }
+    fn fully_writes_slots(&self) -> bool {
+        true
+    }
     fn execute(&self, ctx: &OpContext<'_>) -> Result<Vec<Tensor>, OnnxError> {
         let x = ctx.input(0)?;
         let axes = if let Some(t) = ctx.optional_input(1) {
@@ -182,6 +263,23 @@ impl Operator for UnsqueezeOp {
             ctx.attrs().ints("axes").to_vec()
         };
         Ok(vec![shape::unsqueeze(x, &axes)?])
+    }
+    fn supports_inplace(&self) -> bool {
+        true
+    }
+    fn execute_inplace(
+        &self,
+        mut input: Tensor,
+        ctx: &OpContext<'_>,
+    ) -> Result<Vec<Tensor>, OnnxError> {
+        // Metadata-only: inserting 1-sized axes does not move any element.
+        let raw_axes: Vec<i64> = if let Some(t) = ctx.optional_input(1) {
+            t.data.iter().map(|&v| v as i64).collect()
+        } else {
+            ctx.attrs().ints("axes").to_vec()
+        };
+        input.shape = shape::basic::resolve_unsqueeze_shape(&input.shape, &raw_axes)?;
+        Ok(vec![input])
     }
     fn supports_output_slots(&self) -> bool {
         true
@@ -221,10 +319,28 @@ impl Operator for FlattenOp {
     fn op_type(&self) -> &str {
         "Flatten"
     }
+    fn fully_writes_slots(&self) -> bool {
+        true
+    }
     fn execute(&self, ctx: &OpContext<'_>) -> Result<Vec<Tensor>, OnnxError> {
         let x = ctx.input(0)?;
         let axis = ctx.attrs().i("axis", 1);
         Ok(vec![shape::flatten(x, axis)?])
+    }
+    fn supports_inplace(&self) -> bool {
+        true
+    }
+    fn execute_inplace(
+        &self,
+        mut input: Tensor,
+        ctx: &OpContext<'_>,
+    ) -> Result<Vec<Tensor>, OnnxError> {
+        // Metadata-only: Flatten merges the leading axes into one and the
+        // trailing axes into another; no element moves.
+        let axis = ctx.attrs().i("axis", 1);
+        let (outer, inner) = shape::basic::resolve_flatten_shape(&input.shape, axis)?;
+        input.shape = vec![outer, inner];
+        Ok(vec![input])
     }
     fn supports_output_slots(&self) -> bool {
         true

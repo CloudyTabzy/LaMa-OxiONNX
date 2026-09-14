@@ -11,6 +11,9 @@ impl Operator for MatMulOp {
     fn op_type(&self) -> &str {
         "MatMul"
     }
+    fn fully_writes_slots(&self) -> bool {
+        true
+    }
     fn execute(&self, ctx: &OpContext<'_>) -> Result<Vec<Tensor>, OnnxError> {
         let a = ctx.input(0)?;
         let b = ctx.input(1)?;

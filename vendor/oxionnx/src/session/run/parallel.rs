@@ -697,7 +697,7 @@ impl Session {
                 None
             };
             let slots = if !claimed && !inplace && operator.supports_output_slots() {
-                Self::acquire_output_slots(node, resolved, pool)
+                Self::acquire_output_slots(node, resolved, pool, operator.fully_writes_slots())
             } else {
                 None
             };

@@ -30,6 +30,9 @@ impl Operator for PadOp {
     fn op_type(&self) -> &str {
         "Pad"
     }
+    fn fully_writes_slots(&self) -> bool {
+        true
+    }
     fn execute(&self, ctx: &OpContext<'_>) -> Result<Vec<Tensor>, OnnxError> {
         let input = ctx.input(0)?;
         let pads_tensor = ctx.input(1)?;
@@ -70,22 +73,17 @@ impl Operator for PadOp {
 
         // Route through the single opset-18-aware implementation (negative pads = crop, `wrap`
         // mode, and the `axes` input) instead of hand-rolling a second copy here that can drift
-        // from `execute()`'s behaviour.
-        let result = crate::shape::sequence::pad_axes(
+        // from `execute()`'s behaviour. `pad_axes_into` writes straight into the slot, so the
+        // padded tensor is never materialised twice.
+        crate::shape::sequence::pad_axes_into(
             input,
             &pads_vals,
             mode,
             constant_value,
             axes_vals.as_deref(),
+            &mut slots[0],
         )
         .map_err(OnnxError::ShapeMismatch)?;
-
-        let out = &mut slots[0];
-        if out.shape == result.shape && out.data.len() == result.data.len() {
-            out.data.copy_from_slice(&result.data);
-        } else {
-            *out = result;
-        }
         Ok(())
     }
 }

@@ -168,6 +168,22 @@ optimizer design (see `ORT_STRATEGIES.md`):
 | 12 | 72 × `BatchNorm(Add(conv_a, conv_b))` — the FFC block shape — which ORT reaches via `conv_add_fusion` + `conv_bn_fusion` | `fuse_add_batchnorm`: normalisation distributes over the sum and folds into **both** branches' weights | 72 nodes removed; −53 ms A/B |
 | 13 | 3 × `ConvTranspose → BatchNorm` in the decoder (ORT does not fold this shape) | `fuse_conv_batchnorm` extended to `ConvTranspose` (channel dim is weight dim 1) | ConvTranspose 205 → 167 ms |
 
+### The final layout & slot pass (2026-09-15)
+
+Three more changes, discovered by reading the *other half* of the profile —
+the ops whose per-node time is pure data movement:
+
+| # | Pathology | Fix | Impact (node-time, 512×512) |
+|---|---|---|---|
+| 14 | `Reshape`/`Squeeze`/`Unsqueeze`/`Flatten` never used the engine's in-place path: every node allocated and copied a payload it did not change (and `Reshape`'s slot path did it **twice**) | `supports_inplace`/`execute_inplace` for the four metadata-only ops; `Reshape`'s slot fallback collapsed to one copy | Reshape 303 → 86 ms; Squeeze 21 → 0; Unsqueeze 45 → 0 |
+| 15 | `Concat`/`Slice`/`Transpose` claimed output slots but used the trait's default `execute_into_slots` (materialise a result, then copy it into the slot); `Pad`'s override did the same | Direct-to-slot helpers `concat_into`, `slice_into`, `transpose_into`, `pad_axes_into` | one full copy per node removed (mostly L2-resident, so a modest wall gain) |
+| 16 | Every slot write was preceded by a full **zeroing pass** over the recycled buffer (`SizeClassPool::acquire`) that the kernel then overwrote | `fully_writes_slots()` predicate on `Operator` (default `false`) + `acquire_for_overwrite` for the audited ops (Conv, ConvTranspose, MatMul, the shape ops, Pad, Gather, Cast, Relu, Sigmoid) | ~0.2 s/run at 512×512 |
+
+Verified: engine suite 955 tests across 60 binaries; the three reference
+images are **bit-identical** to the previous build (pure data movement, no
+arithmetic touched); interleaved A/B on 512×512 and 800×600 shows **−4.2%
+wall** on both. The ORT ratio moves from 1.92x to **1.97x**.
+
 ### The arc
 
 | Stage | 512×512 total | What landed |
@@ -198,8 +214,12 @@ interleaved round, and ships in a 4.7 MB binary versus 24.3 MB. (The output
 comparison in those rounds only checked the unmasked region and surfaces
 that the composite replaces outside the mask; the masked region was broken
 by the bugs the [correctness audit](#10-correctness-audit-2026-09-14) later
-found and fixed. With the fixed engine the same A/B still holds — the fixes
+found and fixed. With the fixed engine the same A/B still holds - the fixes
 cost no measurable time.)
+
+A later re-measurement after the final layout/slot pass (see the end of §6)
+put the same interleaved comparison at **ORT 7.37–7.57 s vs OxiONNX
+3.73–3.77 s (load + run) — 1.97x**.
 
 The remaining node-execution profile (3,527 ms total) is headed by
 `Conv` (~1,280 ms, of which the 3×3 im2col gathers and GEMMs are the bulk),
@@ -223,6 +243,11 @@ was 2.4x faster still. Inline asm only wins when the loop is
 instruction-bound; that one was gather-port-bound.
 
 ## 9. What is left (v2 candidates)
+
+> **Status (2026-09-15):** the Reshape/Concat half of this list was addressed
+> in the final layout/slot pass (§6) — the reshape family is now zero-copy
+> on the common path and the sequence ops single-pass. The Conv im2col and
+> `session.run` scaffolding items remain open.
 
 The remaining ~160 ms to reach exactly 2.0x is structural:
 

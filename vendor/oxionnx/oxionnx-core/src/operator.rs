@@ -225,6 +225,24 @@ pub trait Operator: Send + Sync {
         false
     }
 
+    /// Whether [`Self::execute_into_slots`] writes **every element of every
+    /// output slot** for every input it accepts.
+    ///
+    /// When this is `true`, the runtime may hand out recycled buffers without
+    /// zeroing them first. The slot pool's zeroing pass exists only to give
+    /// partially-writing operators (scatters, unpooling) a defined value in
+    /// the elements they skip; for an operator that overwrites the whole
+    /// slot, it is a full pass over the tensor immediately before the kernel
+    /// writes every element again.
+    ///
+    /// The default is `false` and is always safe. Opt in only after checking
+    /// that no input shape leaves any element of any slot untouched — an
+    /// operator that opts in wrongly leaks the recycled buffer's previous
+    /// contents into its output (a wrong-numbers bug, not a crash).
+    fn fully_writes_slots(&self) -> bool {
+        false
+    }
+
     /// Write outputs into caller-provided slots in place.
     /// Default: calls `execute`, copies results into slots (shape-mismatch falls back to replace).
     fn execute_into_slots(

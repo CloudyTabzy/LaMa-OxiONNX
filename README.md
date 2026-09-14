@@ -9,7 +9,7 @@ faster than the ONNX Runtime worker, with output that matches ONNX Runtime
 [![Rust](https://img.shields.io/badge/rust-1.94%2B-orange.svg)](https://www.rust-lang.org)
 [![Platform: Windows x64](https://img.shields.io/badge/platform-Windows%20x64-lightgrey.svg)]()
 [![Engine: OxiONNX 0.1.7 (vendored)](https://img.shields.io/badge/engine-OxiONNX%200.1.7%20(vendored)-green.svg)](vendor/oxionnx)
-[![Speed: 1.92x faster than ORT](https://img.shields.io/badge/speed-1.92x%20vs%20ONNX%20Runtime-brightgreen.svg)](#-benchmarks)
+[![Speed: 2.0x faster than ORT](https://img.shields.io/badge/speed-1.97x%20vs%20ONNX%20Runtime-brightgreen.svg)](#-benchmarks)
 [![Binary: 4.7 MB](https://img.shields.io/badge/binary-4.7%20MB%20(vs%2024.3%20MB)-blueviolet.svg)](#-binary-size)
 [![Validation: 955 tests](https://img.shields.io/badge/tests-955%20passing-success.svg)](vendor/oxionnx)
 [![Output: matches ONNX Runtime](https://img.shields.io/badge/output-%E2%89%A4%201%20LSB%20vs%20ONNX%20Runtime-success.svg)](#-validation)
@@ -18,8 +18,9 @@ faster than the ONNX Runtime worker, with output that matches ONNX Runtime
 
 ## Highlights
 
-- **1.92x faster than ONNX Runtime** on the same machine, same model
-  (7.57 s → 3.95 s for 512×512, six interleaved A/B rounds).
+- **~2x faster than ONNX Runtime** on the same machine, same model
+  (interleaved A/B: 7.40 s → 3.75 s for 512×512 with the final optimisation
+  pass, 1.97x; 1.92x before it).
 - **Installable GIMP plug-in** — [`gimp/install.bat`](gimp) deploys
   `plug-in-lama-oxionnx` side by side with the ONNX Runtime plug-in;
   verified end to end through GIMP's batch mode (worker spawn, cache load,
@@ -82,10 +83,13 @@ The installer needs only GIMP 3.2 and Rust 1.94+ (`cargo`). It:
 
 Restart GIMP, make a selection, and run
 **Filters → Enhance → LaMa Inpaint (OxiONNX)...**. The first inference
-builds the OxiONNX session cache (~373 MB, ~2 minutes) if the prebuilt one
+builds the OxiONNX session cache (~373 MB, a few seconds) if the prebuilt one
 was not available; later runs load it in under a second. Status is logged to
-`plug-ins\lama-oxionnx\lama.log`; `gimp\gimp-verbose.bat` launches GIMP with
-a console and prints the log afterwards.
+`plug-ins\lama-oxionnx\lama.log`, with a per-run phase profile (drawable
+export, worker wall time, inference, result import, shadow merge) — see
+[gimp/README.md](gimp/README.md#log-and-per-run-profiling).
+`gimp\gimp-verbose.bat` launches GIMP with a console and prints the log
+afterwards.
 
 The installer is non-destructive: the ONNX Runtime plug-in in
 `plug-ins\lama-inpaint` keeps working untouched.
@@ -137,6 +141,7 @@ engine-vs-ORT correctness audit is in the report's §10):
 | + GEMM fixes | 9.0 s | N-split packing, merged batched GEMM, direct small-M conv |
 | + shape-op & SIMD wave | 4.5 s | Slice, Div, Transpose, Einsum, 2-channel ConvTranspose, BatchNorm |
 | + session cache & ORT-inspired fusions | **3.93 s** | cache keyed by revision; two graph folds |
+| + final layout & slot pass | **3.51 s (−4.2%)** | in-place Reshape/Squeeze/Unsqueeze/Flatten; direct-to-slot Concat/Slice/Transpose/Pad; no slot zeroing — bit-identical output, 955 tests green |
 
 ### What didn't work (kept on the record)
 
@@ -172,6 +177,7 @@ engine-vs-ORT correctness audit is in the report's §10):
 | **M7 — Harden & vendor** | Engine vendored with Apache-2.0 notices, unit-test suite, cache revisioning, ORT strategy audit ([docs/ORT_STRATEGIES.md](docs/ORT_STRATEGIES.md)) |
 | **M8 — GIMP bridge adopted** | Front-end ported into [`gimp/`](gimp): side-by-side `plug-in-lama-oxionnx`, installer, model/cache handling. Next: large-image ROI path + remaining wiring (see [Roadmap](#-roadmap)) |
 | **M9 — Correctness audit** | White-mask bug (missing /255) fixed; tap-level differential testing against ORT exposed and fixed 3 engine kernel bugs + 1 fallback bug; regression tests added ([report §10](docs/OXIONNX_REPORT.md#10-correctness-audit-2026-09-14)) |
+| **M10 — Final optimisation pass** | In-place layout ops, direct-to-slot writes, and no slot zeroing for audited ops: **−4.2% wall** (interleaved, both sizes), output bit-identical, 955 tests green; **1.97x vs ORT** |
 
 ## 🧪 Validation
 

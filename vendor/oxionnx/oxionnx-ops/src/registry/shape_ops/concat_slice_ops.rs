@@ -12,6 +12,9 @@ impl Operator for ConcatOp {
     fn op_type(&self) -> &str {
         "Concat"
     }
+    fn fully_writes_slots(&self) -> bool {
+        true
+    }
     fn execute(&self, ctx: &OpContext<'_>) -> Result<Vec<Tensor>, OnnxError> {
         let axis = ctx.attrs().i("axis", 0);
         let tensors: Vec<&Tensor> = ctx.inputs.iter().filter_map(|opt| *opt).collect();
@@ -19,6 +22,22 @@ impl Operator for ConcatOp {
     }
     fn supports_output_slots(&self) -> bool {
         true
+    }
+    fn execute_into_slots(
+        &self,
+        ctx: &OpContext<'_>,
+        slots: &mut [Tensor],
+    ) -> Result<(), OnnxError> {
+        if slots.is_empty() {
+            return Ok(());
+        }
+        let axis = ctx.attrs().i("axis", 0);
+        let tensors: Vec<&Tensor> = ctx.inputs.iter().filter_map(|opt| *opt).collect();
+        // One copy per input element straight into the slot; the default slot
+        // path would build an intermediate tensor and copy it in as well.
+        shape::sequence::concat_into(&tensors, axis, &mut slots[0])
+            .map_err(OnnxError::ShapeMismatch)?;
+        Ok(())
     }
 }
 
@@ -28,6 +47,9 @@ pub struct SliceOp;
 impl Operator for SliceOp {
     fn op_type(&self) -> &str {
         "Slice"
+    }
+    fn fully_writes_slots(&self) -> bool {
+        true
     }
     fn execute(&self, ctx: &OpContext<'_>) -> Result<Vec<Tensor>, OnnxError> {
         let x = ctx.input(0)?;
@@ -49,6 +71,36 @@ impl Operator for SliceOp {
     }
     fn supports_output_slots(&self) -> bool {
         true
+    }
+    fn execute_into_slots(
+        &self,
+        ctx: &OpContext<'_>,
+        slots: &mut [Tensor],
+    ) -> Result<(), OnnxError> {
+        if slots.is_empty() {
+            return Ok(());
+        }
+        let x = ctx.input(0)?;
+        let starts: Vec<i64> = ctx.input(1)?.data.iter().map(|&v| v as i64).collect();
+        let ends: Vec<i64> = ctx.input(2)?.data.iter().map(|&v| v as i64).collect();
+        let axes: Option<Vec<i64>> = ctx
+            .optional_input(3)
+            .map(|t| t.data.iter().map(|&v| v as i64).collect());
+        let steps: Option<Vec<i64>> = ctx
+            .optional_input(4)
+            .map(|t| t.data.iter().map(|&v| v as i64).collect());
+        // The slice is written straight into the slot — one pass, not the
+        // default "build a result tensor, then copy it in" double pass.
+        shape::sequence::slice_into(
+            x,
+            &starts,
+            &ends,
+            axes.as_deref(),
+            steps.as_deref(),
+            &mut slots[0],
+        )
+        .map_err(OnnxError::ShapeMismatch)?;
+        Ok(())
     }
 }
 

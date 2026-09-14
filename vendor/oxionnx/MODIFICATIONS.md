@@ -57,6 +57,24 @@ on the 512×512 LaMa graph, on an i7-13620H.
 | `src/optimizer/fusion/conv/tests.rs` | Unit tests for the new pass (fold, shared-operand decline, graph-output decline) | 472 tests total, all green |
 | `src/optimizer/{mod,fusion/mod,fusion/conv/mod}.rs` | Pass wiring, exports, and the `OXIONNX_NO_ADDBN_FUSION` kill switch used to measure the fold A/B in one binary | — |
 
+### Final layout & slot pass (2026-09-15)
+
+All output-preserving — the three reference images are bit-identical to the
+previous build, and the engine suite is green (955 tests).
+
+| File | Change | Impact |
+|---|---|---|
+| `oxionnx-ops/src/registry/shape_ops/reshape_ops.rs` | `supports_inplace` + `execute_inplace` for `Reshape`/`Squeeze`/`Unsqueeze`/`Flatten` (metadata-only: the owned buffer is reused and the shape swapped). `Reshape`'s slot fallback stopped building a throwaway tensor first (one copy, not two) | Reshape 303 → 86 ms; Squeeze 21 → 0; Unsqueeze 45 → 0 (node-time, 512×512) |
+| `oxionnx-ops/src/shape/sequence.rs` | `concat_into`, `slice_into`, `pad_axes_into` — the existing logic refactored to write into a caller-provided tensor (`concat`/`slice`/`pad_axes` are now thin allocating wrappers, so there is one implementation, not two) | Concat/Slice/Pad write straight into the node's slot: one pass, not "build then copy" |
+| `oxionnx-ops/src/shape/basic.rs` | `transpose_into(x, perm, out)` — the blocked-swap/AVX2 paths write into the provided buffer; `transpose` became the allocating wrapper | same, for every `Transpose` node |
+| `oxionnx-ops/src/registry/{conv_ops/conv,conv_ops/pad,math_ops/matmul_gemm,shape_ops/*,indexing_ops,misc_ops,nn_ops/activations}.rs` | `execute_into_slots` wired to the `*_into` helpers; `fully_writes_slots() -> true` for the audited full-overwrite ops (Conv, ConvTranspose, MatMul, Concat, Slice, Transpose, Reshape, Squeeze, Unsqueeze, Flatten, Pad, Gather, Cast, Relu, Sigmoid) | enables the next row |
+| `oxionnx-core/src/operator.rs` | New `fully_writes_slots()` predicate on `Operator`, defaulting to `false` | trait-level opt-in |
+| `oxionnx/src/session/run/{dispatch,parallel}.rs` | `acquire_output_slots` takes `fully_writes` and uses `SizeClassPool::acquire_for_overwrite` when set — the recycled buffer is handed out **without the zeroing pass** the kernel is about to overwrite | ~0.2 s/run at 512×512 |
+
+Interleaved A/B: **−4.2% wall** on both 512×512 and 800×600 (the ORT ratio
+moves 1.92x → 1.97x). The three reference images are bit-identical, which is
+the acceptance test for this entire class of change.
+
 ### Measured and reverted (documented so they are not retried)
 
 * **Custom small-K AVX2 GEMM** for the Einsum contractions (serial and

@@ -9,6 +9,23 @@ use super::basic::normalize_axis;
 
 /// Concatenate tensors along the given axis.
 pub fn concat(tensors: &[&Tensor], axis: i64) -> Result<Tensor, String> {
+    // Struct literal, not `Tensor::new(vec![], vec![])`: the product of an
+    // empty shape is 1, so `Tensor::new` would trip its own debug assertion.
+    let mut out = Tensor {
+        data: vec![],
+        shape: vec![],
+    };
+    concat_into(tensors, axis, &mut out)?;
+    Ok(out)
+}
+
+/// [`concat`] writing into a caller-provided tensor.
+///
+/// The slot path uses this so each input element is copied **once** into the
+/// node's pre-sized output buffer, instead of building an intermediate tensor
+/// and copying that into the slot as well (the default
+/// `Operator::execute_into_slots` behaviour).
+pub fn concat_into(tensors: &[&Tensor], axis: i64, out: &mut Tensor) -> Result<(), String> {
     if tensors.is_empty() {
         return Err("concat: no tensors".into());
     }
@@ -26,22 +43,29 @@ pub fn concat(tensors: &[&Tensor], axis: i64) -> Result<Tensor, String> {
     }
     let mut out_shape = tensors[0].shape.clone();
     out_shape[ax] = tensors.iter().map(|t| t.shape[ax]).sum();
-    let mut out = Vec::with_capacity(out_shape.iter().product());
+    let out_n: usize = out_shape.iter().product();
+    if out.data.len() != out_n {
+        out.data.resize(out_n, 0.0_f32);
+    }
     // Empty-slice products are already 1 (the multiplicative identity) with no clamping needed;
     // clamping a *genuinely* zero-size leading/trailing dim up to 1 would corrupt the
     // shape/data-length invariant for legitimately empty tensors (e.g. a [0, 3] input).
     let outer: usize = tensors[0].shape[..ax].iter().product();
     let inner: usize = tensors[0].shape[ax + 1..].iter().product();
+    let mut off = 0usize;
     for o in 0..outer {
         for t in tensors {
             let seg = t.shape[ax];
             for s in 0..seg {
                 let src_start = (o * t.shape[ax] + s) * inner;
-                out.extend_from_slice(&t.data[src_start..src_start + inner]);
+                out.data[off..off + inner]
+                    .copy_from_slice(&t.data[src_start..src_start + inner]);
+                off += inner;
             }
         }
     }
-    Ok(Tensor::new(out, out_shape))
+    out.shape = out_shape;
+    Ok(())
 }
 
 /// Slice tensor along given axes with start/end/step, per ONNX `Slice` (opset 10+) semantics.
@@ -59,6 +83,27 @@ pub fn slice(
     axes: Option<&[i64]>,
     steps: Option<&[i64]>,
 ) -> Result<Tensor, String> {
+    let mut out = Tensor {
+        data: vec![],
+        shape: vec![],
+    };
+    slice_into(x, starts, ends, axes, steps, &mut out)?;
+    Ok(out)
+}
+
+/// [`slice`] writing into a caller-provided tensor.
+///
+/// The slot path uses this so the slice is written straight into the node's
+/// pre-sized output buffer — one pass over the elements, not the default
+/// "allocate a result, copy it into the slot" double pass.
+pub fn slice_into(
+    x: &Tensor,
+    starts: &[i64],
+    ends: &[i64],
+    axes: Option<&[i64]>,
+    steps: Option<&[i64]>,
+    out: &mut Tensor,
+) -> Result<(), String> {
     let ndim = x.ndim();
     let default_axes: Vec<i64> = (0..starts.len() as i64).collect();
     let axes = axes.unwrap_or(&default_axes);
@@ -136,7 +181,12 @@ pub fn slice(
 
     let out_n: usize = out_shape.iter().product();
     if out_n == 0 {
-        return Ok(Tensor::new(Vec::new(), out_shape));
+        out.data.clear();
+        out.shape = out_shape;
+        return Ok(());
+    }
+    if out.data.len() != out_n {
+        out.data.resize(out_n, 0.0_f32);
     }
 
     let mut strides = vec![0usize; ndim];
@@ -173,20 +223,22 @@ pub fn slice(
     }
     match last_sliced {
         None => {
-            return Ok(Tensor::new(x.data[..out_n].to_vec(), out_shape));
+            out.data.copy_from_slice(&x.data[..out_n]);
+            out.shape = out_shape;
+            return Ok(());
         }
         Some(d) if dim_step[d] == 1 => {
             let run_len: usize = x.shape[d + 1..].iter().product();
             let copy_len = out_shape[d] * run_len;
             let n_outer = out_n / copy_len;
-            let mut out = vec![0.0f32; out_n];
             let mut coord = vec![0usize; d];
             // Seeded with the first output element's source offset.
             let mut in_off: i64 = (0..=d).map(|a| dim_start[a] * strides[a] as i64).sum();
             let mut o_off = 0usize;
             for _ in 0..n_outer {
                 let src = in_off as usize;
-                out[o_off..o_off + copy_len].copy_from_slice(&x.data[src..src + copy_len]);
+                out.data[o_off..o_off + copy_len]
+                    .copy_from_slice(&x.data[src..src + copy_len]);
                 for axis in (0..d).rev() {
                     coord[axis] += 1;
                     in_off += strides[axis] as i64 * dim_step[axis];
@@ -199,12 +251,12 @@ pub fn slice(
                     coord[axis] = 0;
                 }
             }
-            return Ok(Tensor::new(out, out_shape));
+            out.shape = out_shape;
+            return Ok(());
         }
         Some(_) => {}
     }
 
-    let mut out = Vec::with_capacity(out_n);
     for out_idx in 0..out_n {
         let mut rem = out_idx;
         // Signed accumulator: a negative step walks `dim_start` downward, and by construction
@@ -216,9 +268,10 @@ pub fn slice(
             let in_coord = dim_start[d] + coord as i64 * dim_step[d];
             in_idx += in_coord * strides[d] as i64;
         }
-        out.push(x.data[in_idx as usize]);
+        out.data[out_idx] = x.data[in_idx as usize];
     }
-    Ok(Tensor::new(out, out_shape))
+    out.shape = out_shape;
+    Ok(())
 }
 
 /// Pad tensor with constant, reflect, edge, or wrap values, honoring the opset-18 `axes` input.
@@ -236,6 +289,27 @@ pub fn pad_axes(
     constant_value: f32,
     axes: Option<&[i64]>,
 ) -> Result<Tensor, String> {
+    let mut out = Tensor {
+        data: vec![],
+        shape: vec![],
+    };
+    pad_axes_into(input, pads, mode, constant_value, axes, &mut out)?;
+    Ok(out)
+}
+
+/// [`pad_axes`] writing into a caller-provided tensor.
+///
+/// The slot path uses this so the padded tensor is written straight into the
+/// node's pre-sized output buffer, instead of building an intermediate tensor
+/// and copying it into the slot as well.
+pub fn pad_axes_into(
+    input: &Tensor,
+    pads: &[i64],
+    mode: &str,
+    constant_value: f32,
+    axes: Option<&[i64]>,
+    out: &mut Tensor,
+) -> Result<(), String> {
     let ndim = input.ndim();
     if !matches!(mode, "constant" | "reflect" | "edge" | "wrap") {
         return Err(format!(
@@ -285,7 +359,9 @@ pub fn pad_axes(
         .ok_or_else(|| "pad: output element count overflows".to_string())?;
 
     if out_n == 0 {
-        return Ok(Tensor::new(Vec::new(), out_shape));
+        out.data.clear();
+        out.shape = out_shape;
+        return Ok(());
     }
     // reflect/edge/wrap all need at least one source element per padded axis; an empty input
     // axis being asked to grow has no data to reflect/repeat/extend from (constant mode is
@@ -308,7 +384,10 @@ pub fn pad_axes(
         out_strides[i] = s;
         s *= out_shape[i];
     }
-    let mut out = vec![constant_value; out_n];
+    if out.data.len() != out_n {
+        out.data.resize(out_n, constant_value);
+    }
+    out.data.fill(constant_value);
     match mode {
         "reflect" => {
             // Fast path: 4D NCHW reflect pad on last two dims (H, W).
@@ -331,12 +410,13 @@ pub fn pad_axes(
                     end[2],
                     begin[3],
                     end[3],
-                    &mut out,
+                    &mut out.data,
                 );
-                return Ok(Tensor::new(out, out_shape));
+                out.shape = out_shape;
+                return Ok(());
             }
 
-            for (out_idx, out_val) in out.iter_mut().enumerate() {
+            for (out_idx, out_val) in out.data.iter_mut().enumerate() {
                 let mut rem = out_idx;
                 let mut in_idx = 0usize;
                 let mut valid = true;
@@ -367,7 +447,7 @@ pub fn pad_axes(
             }
         }
         "edge" => {
-            for (out_idx, out_val) in out.iter_mut().enumerate() {
+            for (out_idx, out_val) in out.data.iter_mut().enumerate() {
                 let mut rem = out_idx;
                 let mut in_idx = 0usize;
                 for d in 0..ndim {
@@ -383,7 +463,7 @@ pub fn pad_axes(
             }
         }
         "wrap" => {
-            for (out_idx, out_val) in out.iter_mut().enumerate() {
+            for (out_idx, out_val) in out.data.iter_mut().enumerate() {
                 let mut rem = out_idx;
                 let mut in_idx = 0usize;
                 for d in 0..ndim {
@@ -402,7 +482,7 @@ pub fn pad_axes(
             // negative `begin`/`end` (crop) is handled by the exact same in-bounds test: the
             // shifted coordinate simply starts further into `input` than `out_coord` alone
             // would suggest.
-            for (out_idx, out_val) in out.iter_mut().enumerate() {
+            for (out_idx, out_val) in out.data.iter_mut().enumerate() {
                 let mut rem = out_idx;
                 let mut in_idx = 0usize;
                 let mut inside = true;
@@ -422,7 +502,8 @@ pub fn pad_axes(
             }
         }
     }
-    Ok(Tensor::new(out, out_shape))
+    out.shape = out_shape;
+    Ok(())
 }
 
 /// Legacy 4-argument Pad entry point, equivalent to [`pad_axes`] with `axes = None` (the

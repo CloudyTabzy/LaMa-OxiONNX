@@ -145,6 +145,9 @@ impl Operator for ReluOp {
     fn op_type(&self) -> &str {
         "Relu"
     }
+    fn fully_writes_slots(&self) -> bool {
+        true
+    }
     fn execute(&self, ctx: &OpContext<'_>) -> Result<Vec<Tensor>, OnnxError> {
         Ok(vec![nn::relu(ctx.input(0)?)])
     }
@@ -215,6 +218,9 @@ pub struct SigmoidOp;
 impl Operator for SigmoidOp {
     fn op_type(&self) -> &str {
         "Sigmoid"
+    }
+    fn fully_writes_slots(&self) -> bool {
+        true
     }
     fn execute(&self, ctx: &OpContext<'_>) -> Result<Vec<Tensor>, OnnxError> {
         Ok(vec![nn::sigmoid(ctx.input(0)?)])

@@ -11,6 +11,9 @@ impl Operator for GatherOp {
     fn op_type(&self) -> &str {
         "Gather"
     }
+    fn fully_writes_slots(&self) -> bool {
+        true
+    }
     fn execute(&self, ctx: &OpContext<'_>) -> Result<Vec<Tensor>, OnnxError> {
         let x = ctx.input(0)?;
         let idx = ctx.input(1)?;

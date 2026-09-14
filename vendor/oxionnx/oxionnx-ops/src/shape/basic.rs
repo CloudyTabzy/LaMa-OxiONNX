@@ -343,6 +343,22 @@ unsafe fn deinterleave_2xn(src: *const f32, even: *mut f32, odd: *mut f32, p_len
 }
 
 pub fn transpose(x: &Tensor, perm: &[usize]) -> Result<Tensor, String> {
+    // A transpose is a permutation of the elements, so the output holds the
+    // same count as the input and the buffer can be sized before the output
+    // shape is known.
+    let shape_numel: usize = x.shape.iter().product();
+    let mut data = vec![0.0f32; shape_numel];
+    let out_shape = transpose_into(x, perm, &mut data)?;
+    Ok(Tensor::new(data, out_shape))
+}
+
+/// [`transpose`] writing into a caller-provided buffer.
+///
+/// `out` must hold at least `x.shape.iter().product()` elements and must not
+/// overlap `x.data`. The slot path passes the node's pre-sized output buffer,
+/// so the result is written once instead of being built in an intermediate
+/// allocation and copied into the slot afterwards.
+pub fn transpose_into(x: &Tensor, perm: &[usize], out: &mut [f32]) -> Result<Vec<usize>, String> {
     // Row-major (C-order) strides for `shape`: `strides[i] = prod(shape[i+1..])`.
     // Nested inside `transpose` (the only op owned in this file) rather than a
     // file-scope item shared with the rest of `basic.rs`.
@@ -394,12 +410,11 @@ pub fn transpose(x: &Tensor, perm: &[usize]) -> Result<Tensor, String> {
     // of `x.shape`, so this is exactly `out_shape.iter().product()`. For a well-formed
     // tensor (the overwhelming common case) it is the same number as before.
     let shape_numel: usize = x.shape.iter().product();
-    let mut out = vec![0.0f32; shape_numel];
     // A zero-size dimension anywhere makes `shape_numel == 0`: bail out before any of the
     // stride/division math below, which otherwise risks a `0 / 0` (the trailing-run length
     // can itself be 0 when a size-0 axis lands in the "run"). Nothing to move either way.
     if shape_numel == 0 {
-        return Ok(Tensor::new(out, out_shape));
+        return Ok(out_shape);
     }
     // The opposite invariant violation -- a buffer *shorter* than the shape describes -- has
     // no correct transpose: some source element the output requires does not exist. Both the
@@ -410,6 +425,12 @@ pub fn transpose(x: &Tensor, perm: &[usize]) -> Result<Tensor, String> {
             "transpose: data buffer holds {} elements but shape {:?} describes {shape_numel}",
             x.data.len(),
             x.shape
+        ));
+    }
+    if out.len() < shape_numel {
+        return Err(format!(
+            "transpose: output buffer holds {} elements but the transpose needs {shape_numel}",
+            out.len()
         ));
     }
 
@@ -462,7 +483,7 @@ pub fn transpose(x: &Tensor, perm: &[usize]) -> Result<Tensor, String> {
                 bi = i_end;
             }
         }
-        return Ok(Tensor::new(out, out_shape));
+        return Ok(out_shape);
     }
 
     // ── Blocked-swap fast path ────────────────────────────────────────────
@@ -532,7 +553,7 @@ pub fn transpose(x: &Tensor, perm: &[usize]) -> Result<Tensor, String> {
                                 );
                             }
                         }
-                        return Ok(Tensor::new(out, out_shape));
+                        return Ok(out_shape);
                     }
 
                     // Special case: interleave a `[2, Q]` matrix into `[Q, 2]`
@@ -553,7 +574,7 @@ pub fn transpose(x: &Tensor, perm: &[usize]) -> Result<Tensor, String> {
                                 );
                             }
                         }
-                        return Ok(Tensor::new(out, out_shape));
+                        return Ok(out_shape);
                     }
 
                     // Inner-dim == 1: use the register-blocked AVX2 8x8
@@ -575,7 +596,7 @@ pub fn transpose(x: &Tensor, perm: &[usize]) -> Result<Tensor, String> {
                                 );
                             }
                         }
-                        return Ok(Tensor::new(out, out_shape));
+                        return Ok(out_shape);
                     }
 
                     for ob in 0..outer_len {
@@ -599,7 +620,7 @@ pub fn transpose(x: &Tensor, perm: &[usize]) -> Result<Tensor, String> {
                             p0 = p1;
                         }
                     }
-                    return Ok(Tensor::new(out, out_shape));
+                    return Ok(out_shape);
                 }
             }
         }
@@ -623,7 +644,7 @@ pub fn transpose(x: &Tensor, perm: &[usize]) -> Result<Tensor, String> {
         // `perm` is the identity permutation (or `ndim == 0`): the whole
         // tensor is one contiguous run.
         out.copy_from_slice(&x.data);
-        return Ok(Tensor::new(out, out_shape));
+        return Ok(out_shape);
     }
 
     // The remaining `outer_ndim` axes are walked with an increment-and-carry
@@ -657,7 +678,7 @@ pub fn transpose(x: &Tensor, perm: &[usize]) -> Result<Tensor, String> {
             coord[axis] = 0;
         }
     }
-    Ok(Tensor::new(out, out_shape))
+    Ok(out_shape)
 }
 
 /// Resolve the output shape for Squeeze: drop the given (possibly negative) axes, provided
