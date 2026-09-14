@@ -1,0 +1,3 @@
+# Batch files are parsed by cmd.exe, which requires CRLF line endings for
+# reliable label/goto handling.
+*.bat text eol=crlf
