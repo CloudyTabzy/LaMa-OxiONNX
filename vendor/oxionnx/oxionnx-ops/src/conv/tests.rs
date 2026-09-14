@@ -1686,3 +1686,185 @@ fn perf_probe_conv2d_im2col_blocking() {
         );
     }
 }
+
+// ---------------------------------------------------------------------------
+// Regression tests for the GIMP LaMa fork's conv kernels (2026-09)
+// ---------------------------------------------------------------------------
+
+/// Deterministic pseudo-random values in [-0.5, 0.5).
+fn pseudo_random(count: usize, seed: u32) -> Vec<f32> {
+    let mut s = seed;
+    (0..count)
+        .map(|_| {
+            s = s.wrapping_mul(1_664_525).wrapping_add(1_013_904_223);
+            ((s >> 8) as f32 / 16_777_216.0) - 0.5
+        })
+        .collect()
+}
+
+/// Naive ConvTranspose reference (ONNX scatter semantics).
+#[allow(clippy::too_many_arguments)]
+fn reference_conv_transpose(
+    input: &[f32],
+    in_shape: [usize; 4],
+    weight: &[f32],
+    w_shape: [usize; 4],
+    strides: [usize; 2],
+    pads: [usize; 4],
+    output_padding: [usize; 2],
+) -> (Vec<usize>, Vec<f32>) {
+    let (n, c_in, h, w) = (in_shape[0], in_shape[1], in_shape[2], in_shape[3]);
+    let c_out = w_shape[1];
+    let (kh, kw) = (w_shape[2], w_shape[3]);
+    let [sh, sw] = strides;
+    let (pt, pl, pb, pr) = (pads[0], pads[1], pads[2], pads[3]);
+    let oh = (h - 1) * sh + kh - pt - pb + output_padding[0];
+    let ow = (w - 1) * sw + kw - pl - pr + output_padding[1];
+    let mut out = vec![0.0_f32; n * c_out * oh * ow];
+    for ni in 0..n {
+        for ci in 0..c_in {
+            for iy in 0..h {
+                for ix in 0..w {
+                    let v = input[((ni * c_in + ci) * h + iy) * w + ix];
+                    for co in 0..c_out {
+                        for ky in 0..kh {
+                            for kx in 0..kw {
+                                let oy = iy * sh + ky;
+                                let ox = ix * sw + kx;
+                                if oy < pt || ox < pl {
+                                    continue;
+                                }
+                                let (oy, ox) = (oy - pt, ox - pl);
+                                if oy >= oh || ox >= ow {
+                                    continue;
+                                }
+                                let wv = weight[((ci * c_out + co) * kh + ky) * kw + kx];
+                                out[((ni * c_out + co) * oh + oy) * ow + ox] += v * wv;
+                            }
+                        }
+                    }
+                }
+            }
+        }
+    }
+    (vec![n, c_out, oh, ow], out)
+}
+
+/// Naive Conv2d reference; weight is ONNX `[c_out][c_in][kh][kw]`.
+#[allow(clippy::too_many_arguments)]
+fn reference_conv2d(
+    input: &[f32],
+    in_shape: [usize; 4],
+    weight: &[f32],
+    w_shape: [usize; 4],
+    strides: [usize; 2],
+    pads: [usize; 4],
+) -> (Vec<usize>, Vec<f32>) {
+    let (n, c_in, h, w) = (in_shape[0], in_shape[1], in_shape[2], in_shape[3]);
+    let c_out = w_shape[0];
+    let (kh, kw) = (w_shape[2], w_shape[3]);
+    let [sh, sw] = strides;
+    let (pt, pl) = (pads[0], pads[1]);
+    let oh = (h + pads[0] + pads[2] - kh) / sh + 1;
+    let ow = (w + pads[1] + pads[3] - kw) / sw + 1;
+    let mut out = vec![0.0_f32; n * c_out * oh * ow];
+    for ni in 0..n {
+        for co in 0..c_out {
+            for oy in 0..oh {
+                for ox in 0..ow {
+                    let mut acc = 0.0_f32;
+                    for ci in 0..c_in {
+                        for ky in 0..kh {
+                            for kx in 0..kw {
+                                let iy = (oy * sh + ky) as isize - pt as isize;
+                                let ix = (ox * sw + kx) as isize - pl as isize;
+                                if iy < 0 || ix < 0 || iy >= h as isize || ix >= w as isize {
+                                    continue;
+                                }
+                                let iv =
+                                    input[((ni * c_in + ci) * h + iy as usize) * w + ix as usize];
+                                let wv = weight[((co * c_in + ci) * kh + ky) * kw + kx];
+                                acc += iv * wv;
+                            }
+                        }
+                    }
+                    out[((ni * c_out + co) * oh + oy) * ow + ox] = acc;
+                }
+            }
+        }
+    }
+    (vec![n, c_out, oh, ow], out)
+}
+
+/// The stride-2/kernel-3/pad-1 fast path must match the scatter semantics on
+/// odd output rows too (the ky=0/ky=2 rows were once paired with the wrong
+/// input rows) and must not read past the bottom edge of the input.
+#[test]
+fn test_conv_transpose_s2k3p1_matches_reference() {
+    for c_out in [3usize, 4] {
+        let input = Tensor::new(pseudo_random(2 * 5 * 5, 7), vec![1, 2, 5, 5]);
+        let weight = Tensor::new(pseudo_random(2 * c_out * 3 * 3, 11), vec![2, c_out, 3, 3]);
+        let got = conv_transpose2d(
+            &input,
+            &weight,
+            None,
+            [2, 2],
+            [1, 1, 1, 1],
+            [1, 1],
+            [1, 1],
+            1,
+        )
+        .expect("conv_transpose2d failed");
+        let (shape, want) = reference_conv_transpose(
+            &input.data,
+            [1, 2, 5, 5],
+            &weight.data,
+            [2, c_out, 3, 3],
+            [2, 2],
+            [1, 1, 1, 1],
+            [1, 1],
+        );
+        assert_eq!(got.shape, shape);
+        assert_close(&got.data, &want, 1e-4, &format!("s2k3p1 c_out={c_out}"));
+    }
+}
+
+/// The zero-interleave + conv fallback must honour strides and the spatial
+/// kernel flip for non-fast-path configurations.
+#[test]
+fn test_conv_transpose_fallback_matches_reference() {
+    let cases: [([usize; 4], [usize; 4], [usize; 2], [usize; 4], [usize; 2]); 2] = [
+        // kernel 2x2, stride 2, no padding
+        ([1, 1, 3, 3], [1, 1, 2, 2], [2, 2], [0, 0, 0, 0], [0, 0]),
+        // asymmetric kernel 3x2, stride 2, pad 1
+        ([1, 1, 3, 3], [1, 1, 3, 2], [2, 2], [1, 1, 1, 1], [1, 1]),
+    ];
+    for (case, (in_shape, w_shape, strides, pads, out_pad)) in cases.iter().enumerate() {
+        let in_len: usize = in_shape.iter().product();
+        let w_len: usize = w_shape.iter().product();
+        let input = Tensor::new(pseudo_random(in_len, 13 + case as u32), in_shape.to_vec());
+        let weight = Tensor::new(pseudo_random(w_len, 29 + case as u32), w_shape.to_vec());
+        let got = conv_transpose2d(&input, &weight, None, *strides, *pads, *out_pad, [1, 1], 1)
+            .expect("conv_transpose2d failed");
+        let (shape, want) = reference_conv_transpose(
+            &input.data, *in_shape, &weight.data, *w_shape, *strides, *pads, *out_pad,
+        );
+        assert_eq!(got.shape, shape, "case {case}");
+        assert_close(&got.data, &want, 1e-4, &format!("fallback case {case}"));
+    }
+}
+
+/// The direct small-M kernel must index weights in the ONNX
+/// `[c_out][c_in][kh][kw]` layout (it once assumed `[c_in][c_out][kh][kw]`).
+#[test]
+fn test_conv2d_small_m_matches_reference() {
+    let in_shape = [1usize, 8, 66, 66];
+    let w_shape = [2usize, 8, 3, 3];
+    let input = Tensor::new(pseudo_random(8 * 66 * 66, 3), in_shape.to_vec());
+    let weight = Tensor::new(pseudo_random(2 * 8 * 3 * 3, 5), w_shape.to_vec());
+    let got = conv2d(&input, &weight, None, [1, 1], [0, 0, 0, 0], [1, 1], 1);
+    let (shape, want) =
+        reference_conv2d(&input.data, in_shape, &weight.data, w_shape, [1, 1], [0, 0, 0, 0]);
+    assert_eq!(got.shape, shape);
+    assert_close(&got.data, &want, 1e-3, "small-M conv");
+}

@@ -23,7 +23,11 @@ upstream issue (<https://github.com/cool-japan/oxionnx/issues/4>) documented
 the model-loading failures we found at 0.1.4 and the upstream fixes; after
 those landed we profiled per-node and patched the hot paths. The fork now
 runs the same graph at ~3.9 s — faster than ONNX Runtime's CPU path
-(7.5 s) on the same machine — with bit-identical 8-bit output.
+(7.5 s) on the same machine — with output verified against ONNX Runtime
+(≤4e-4 on float tensors, ≤1 LSB on 8-bit results). See the *Correctness
+fixes* section below: the first round of performance rewrites introduced
+four kernel bugs that only a tensor-level comparison against ORT could
+expose.
 
 ## Changes
 
@@ -62,17 +66,41 @@ on the 512×512 LaMa graph, on an i7-13620H.
   387 ms vs 354 ms — on this CPU the input already stays resident across the
   fine-grained per-plane tasks, so coarse tasks only cost load balance.
 
+### Correctness fixes (2026-09-14)
+
+Found by a tap-level differential harness against ONNX Runtime (every N-th
+graph output promoted to a model output, both engines run with
+optimisations off, tensors diffed in order — first divergent node localised,
+then hand-verified against the weights). All four were introduced by the
+performance rewrites above, and all were invisible to comparisons between
+OxiONNX builds:
+
+| File | Bug | Fix |
+|---|---|---|
+| `src/conv/transpose.rs` | s2k3 AVX2 kernels (single- and paired-channel): on odd output rows the ky=0 weight set was paired with the ky=2 input row and vice versa | Pair `u` (row `(oy-1)/2`) with ky=2 and `v` (row `(oy+1)/2`) with ky=0, in both kernels |
+| `src/conv/transpose.rs` | s2k3 AVX2 kernels: last odd output row reads the non-existent input row `(oy+1)/2 == h` out of bounds | Route that one row through `convtranspose_row_tail` (bounds-checked) |
+| `src/conv/conv2d.rs` | `conv2d_direct_small_m_f32`: weights indexed as `[c_in][c_out][k][k]` instead of ONNX `[c_out][c_in][k][k]` (both SIMD loops and the scalar tail) | Correct the index arithmetic (`ci*kh*kw + co*c_in*kh*kw`) |
+| `src/conv/transpose.rs` | `try_convtranspose_as_conv` fallback: passed the original stride to the inner conv (output size collapsed → panic) and never spatially flipped the kernel | Stride 1 for the inner conv; flip the kernel during the `[ci][co]→[co][ci]` transpose (new tests cover both) |
+
+Regression tests added to `oxionnx-ops/src/conv/tests.rs` (naive references
+with asymmetric weights and odd dimensions): the s2k3 fast path (both
+channel counts), the zero-interleave fallback (two configurations), and the
+small-M conv. Engine suite: 955 tests, all green.
+
 ## Upgrading upstream
 
 When rebasing onto a newer OxiONNX:
 
 1. Re-apply the patches listed above (the file-level notices mark every
    site).
-2. Re-run `cargo test --release --features simd --lib` from this directory.
-3. Re-run the worker's image comparisons (three reference images in
-   `../test_data/`, all must be bit-identical) — and **bump the worker's
-   `SESSION_CACHE_REVISION`** so stale caches from the previous optimizer are
-   not loaded.
+2. Re-run `cargo test --release --features simd` from this directory.
+3. Re-run the worker's image comparisons against **ONNX Runtime** on the
+   three reference images in `../test_data/` (≤1 LSB at 8-bit) — and, when
+   the optimizer changes, **bump the worker's `SESSION_CACHE_REVISION`** so
+   stale caches from the previous optimizer are not loaded. For any kernel
+   change, use the tap-level harness (`LAMA_OXIONNX_DUMP_TAPS` +
+   `OXIONNX_OPT_LEVEL=none`) rather than comparing against previous OxiONNX
+   builds.
 
 ## Notes for upstream
 

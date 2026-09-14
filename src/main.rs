@@ -18,7 +18,7 @@ use std::time::Instant;
 use anyhow::{anyhow, bail, Context, Result};
 use clap::Parser;
 use ndarray::{s, Array2, Array3, Array4};
-use oxionnx::{Session, Tensor};
+use oxionnx::{OptLevel, Session, Tensor};
 
 /// Mask threshold in 0..=255. Any nonzero pixel becomes "inpaint",
 /// matching the reference LaMa behavior (predict.py: `(mask > 0) * 1`).
@@ -158,6 +158,18 @@ fn run_inpaint(args: &Args) -> Result<()> {
     //     correctness-shaped failure, not merely a slow one.
     let use_cache = std::env::var("OXIONNX_NO_SESSION_CACHE").ok().as_deref()
         .map_or(true, |v| matches!(v, "" | "0" | "false" | "no" | "off"));
+
+    // QA knob: force a graph-optimization level (`OXIONNX_OPT_LEVEL` =
+    // none|basic|extended|all) to bisect optimizer-related numerics. Pair it
+    // with `OXIONNX_NO_SESSION_CACHE=1`, otherwise the cached graph wins.
+    let opt_level = match std::env::var("OXIONNX_OPT_LEVEL").ok().as_deref() {
+        Some("none") => Some(OptLevel::None),
+        Some("basic") => Some(OptLevel::Basic),
+        Some("extended") => Some(OptLevel::Extended),
+        Some("all") => Some(OptLevel::All),
+        _ => None,
+    };
+
     let cache_path = session_cache_path(&model_path);
 
     // Best-effort: drop the pre-revision cache name from earlier builds so a
@@ -180,7 +192,12 @@ fn run_inpaint(args: &Args) -> Result<()> {
         cache_meta.len() > 0 && mtime(&cache_meta) >= mtime(&model_meta)
     };
 
-    let session = if profile {
+    let session = if let Some(level) = opt_level {
+        Session::builder()
+            .with_optimization_level(level)
+            .load(&model_path)
+            .with_context(|| format!("failed to load ONNX model: {}", model_path.display()))?
+    } else if profile {
         Session::builder()
             .with_profiling()
             .load(&model_path)
@@ -256,6 +273,39 @@ fn run_inpaint(args: &Args) -> Result<()> {
         .run(&inputs)
         .with_context(|| "OxiONNX inference failed")?;
 
+    // QA knob: dump every graph output as raw f32 + a `.shape` file. Used
+    // with a tap-augmented model to diff per-node tensors against a
+    // reference engine (`LAMA_OXIONNX_DUMP_TAPS=<dir>`).
+    if let Ok(dump_dir) = std::env::var("LAMA_OXIONNX_DUMP_TAPS") {
+        let dump_dir = PathBuf::from(dump_dir);
+        if std::fs::create_dir_all(&dump_dir).is_ok() {
+            for (name, tensor) in &outputs {
+                let safe: String = name
+                    .chars()
+                    .map(|c| {
+                        if c.is_ascii_alphanumeric() || matches!(c, '_' | '-' | '.') {
+                            c
+                        } else {
+                            '_'
+                        }
+                    })
+                    .collect();
+                let shape = tensor
+                    .shape
+                    .iter()
+                    .map(|d| d.to_string())
+                    .collect::<Vec<_>>()
+                    .join(" ");
+                let _ = std::fs::write(dump_dir.join(format!("{safe}.shape")), shape);
+                let mut bytes = Vec::with_capacity(tensor.data.len() * 4);
+                for v in &tensor.data {
+                    bytes.extend_from_slice(&v.to_le_bytes());
+                }
+                let _ = std::fs::write(dump_dir.join(format!("{safe}.bin")), bytes);
+            }
+        }
+    }
+
     let run_elapsed = run_start.elapsed();
     eprintln!(
         "[LAMA_MARKER] timing load_ms={} run_ms={}",
@@ -274,13 +324,17 @@ fn run_inpaint(args: &Args) -> Result<()> {
         bail!("expected 4D model output, got {}D", out_shape.len());
     }
     let (_, _, out_h, out_w) = (out_shape[0], out_shape[1], out_shape[2], out_shape[3]);
+    // Convert CHW output back to HWC. The LaMa model outputs 0..255; the
+    // rest of the pipeline (composite, write) works in 0..1 like the
+    // reference Python/ORT workers, which divide by 255 right here.
     let out_hwc: Array3<f32> = {
+        let inv255 = 1.0f32 / 255.0;
         let mut arr = Array3::<f32>::zeros((out_h, out_w, 3));
         let data = &output_tensor.data;
         for y in 0..out_h {
             for x in 0..out_w {
                 for ch in 0..3 {
-                    arr[[y, x, ch]] = data[ch * out_h * out_w + y * out_w + x];
+                    arr[[y, x, ch]] = data[ch * out_h * out_w + y * out_w + x] * inv255;
                 }
             }
         }

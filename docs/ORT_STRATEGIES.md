@@ -114,6 +114,9 @@ step further. **v2.**
    runs strided by `C_out`).
 3. Docs: this file.
 
-Full test suite: **472 passed, 0 failed** (`cargo test --release --features
-simd --lib`). All three reference images bit-identical (512×512, 800×600,
-1000×700; max per-channel diff 0).
+Full test suite at the time of the fusion work: **472 passed, 0 failed**
+(`cargo test --release --features simd --lib`), outputs unchanged versus the
+previous build. (That check compared OxiONNX against itself; the later
+[correctness audit](OXIONNX_REPORT.md#10-correctness-audit-2026-09-14)
+re-verified everything against ONNX Runtime at tensor level. Current suite:
+955 tests across 60 binaries.)

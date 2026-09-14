@@ -1,9 +1,9 @@
 # LaMa Inpainting Worker — Pure-Rust OxiONNX Backend
 
 **A sidecar worker for the GIMP LaMa inpainting plug-in that runs the model
-entirely in Rust — no C/C++, no ONNX Runtime, no protobuf — and is _1.9x
-faster than the ONNX Runtime worker_ while producing bit-identical 8-bit
-output.**
+entirely in Rust - no C/C++, no ONNX Runtime, no protobuf - and is ~2x
+faster than the ONNX Runtime worker, with output that matches ONNX Runtime
+(max 1 LSB at 8-bit, float tensors within 4e-4).**
 
 [![License: Apache-2.0](https://img.shields.io/badge/license-Apache--2.0-blue.svg)](LICENSE)
 [![Rust](https://img.shields.io/badge/rust-1.94%2B-orange.svg)](https://www.rust-lang.org)
@@ -11,8 +11,8 @@ output.**
 [![Engine: OxiONNX 0.1.7 (vendored)](https://img.shields.io/badge/engine-OxiONNX%200.1.7%20(vendored)-green.svg)](vendor/oxionnx)
 [![Speed: 1.92x faster than ORT](https://img.shields.io/badge/speed-1.92x%20vs%20ONNX%20Runtime-brightgreen.svg)](#-benchmarks)
 [![Binary: 4.7 MB](https://img.shields.io/badge/binary-4.7%20MB%20(vs%2024.3%20MB)-blueviolet.svg)](#-binary-size)
-[![Validation: 472 tests](https://img.shields.io/badge/tests-472%20passing-success.svg)](vendor/oxionnx)
-[![Output: bit-identical](https://img.shields.io/badge/output-bit--identical-success.svg)](#-validation)
+[![Validation: 955 tests](https://img.shields.io/badge/tests-955%20passing-success.svg)](vendor/oxionnx)
+[![Output: matches ONNX Runtime](https://img.shields.io/badge/output-%E2%89%A4%201%20LSB%20vs%20ONNX%20Runtime-success.svg)](#-validation)
 
 ---
 
@@ -20,11 +20,16 @@ output.**
 
 - **1.92x faster than ONNX Runtime** on the same machine, same model
   (7.57 s → 3.95 s for 512×512, six interleaved A/B rounds).
+- **Installable GIMP plug-in** — [`gimp/install.bat`](gimp) deploys
+  `plug-in-lama-oxionnx` side by side with the ONNX Runtime plug-in;
+  verified end to end through GIMP's batch mode (worker spawn, cache load,
+  inference, shadow-buffer merge).
 - **4.7 MB binary** versus ORT's 24.3 MB — a 5.2x smaller sidecar, with zero
   native dependencies to ship.
-- **Bit-identical output**: every optimisation in this repository is checked
-  against the original engine's PNG output byte-for-byte on three reference
-  images.
+- **Correct output, verified at tensor level**: a tap-level differential
+  harness compares every sampled intermediate tensor against ONNX Runtime;
+  after the fixes in the [correctness audit](docs/OXIONNX_REPORT.md#10-correctness-audit-2026-09-14)
+  the engines agree to ≤4e-4 in float and ≤1 LSB in the 8-bit composite.
 - **12.3x faster than stock OxiONNX 0.1.7** (48.3 s → 3.93 s) — the speed came
   from profiling and fixing a handful of pathological code paths, not from
   swapping engines (see [Benchmarks](#-benchmarks) and
@@ -38,20 +43,59 @@ output.**
 
 ```
 GIMP 3.2 process (MINGW Python + GEGL)
-  └─ lama-inpaint.py  …… exports drawable + mask to temp PNGs
-        └─ spawns a worker process (out of process, always)
-              ├─ lama_worker.py        Python + onnxruntime   (default)
-              ├─ lama-worker.exe       Rust + ONNX Runtime    (opt-in)
-              └─ lama-worker-oxionnx   Rust + OxiONNX   ←──  this repository
-                    · loads lama_fp32.onnx (17,480 nodes)
-                    · pads to mod-16, one inference, soft-mask composite
-                    · writes RGBA result with the input alpha preserved
+  └─ gimp/lama-oxionnx.py  …… exports drawable + mask to temp PNGs
+        └─ spawns lama-worker-oxionnx.exe (out of process, always)
+              · loads lama_fp32.onnx (17,480 nodes)
+              · pads to mod-16, one inference, soft-mask composite
+              · writes RGBA result with the input alpha preserved
 ```
 
-The worker is a **drop-in replacement**: identical CLI
-(`--image --mask --model --output`), identical markers on stderr
-(`[LAMA_MARKER] phase …`), identical PNG conventions. The GIMP side does not
-need to know which engine ran.
+The GIMP front-end in [`gimp/`](gimp) is the portable bridge: it registers
+`plug-in-lama-oxionnx` under **Filters → Enhance → LaMa Inpaint (OxiONNX)...**,
+exports the drawable and the soft selection mask through GEGL, drives a
+progress bar while the worker runs, and applies the result through the
+drawable's shadow buffer. The worker is a **drop-in replacement**: identical
+CLI (`--image --mask --model --output`) and `[LAMA_MARKER]` stderr markers
+as the ONNX Runtime worker, so the two are interchangeable — and, because
+this plug-in uses its own procedure name, menu entry, and install directory,
+**both can be installed side by side and compared in the same GIMP session**.
+
+## 🧩 Install as a GIMP plug-in (Windows)
+
+```bat
+git clone <this repository>
+cd LaMa-OxiONNX\gimp
+install.bat
+```
+
+The installer needs only GIMP 3.2 and Rust 1.94+ (`cargo`). It:
+
+1. writes the per-user `.interp` alias for the plug-in shebang
+   (never touches GIMP's installation files),
+2. copies `lama-oxionnx.py` to `%APPDATA%\GIMP\3.2\plug-ins\lama-oxionnx\`,
+3. installs the LaMa model — copied from `gimp\lama_fp32.onnx` if present,
+   else from the existing ONNX Runtime plug-in install
+   (`plug-ins\lama-inpaint`), else downloaded from the v1.1.0 release
+   (~200 MB), together with the prebuilt session cache when available,
+4. runs `cargo build --release` and copies `lama-worker-oxionnx.exe` next to
+   the plug-in.
+
+Restart GIMP, make a selection, and run
+**Filters → Enhance → LaMa Inpaint (OxiONNX)...**. The first inference
+builds the OxiONNX session cache (~373 MB, ~2 minutes) if the prebuilt one
+was not available; later runs load it in under a second. Status is logged to
+`plug-ins\lama-oxionnx\lama.log`; `gimp\gimp-verbose.bat` launches GIMP with
+a console and prints the log afterwards.
+
+The installer is non-destructive: the ONNX Runtime plug-in in
+`plug-ins\lama-inpaint` keeps working untouched.
+
+Two environment overrides, both optional:
+
+| Variable | Effect |
+|---|---|
+| `LAMA_OXIONNX_WORKER` | Use a development build of the worker instead of the installed one |
+| `LAMA_OXIONNX_MAX_PIXELS` | Override the 4 MP guard (the worker has no ROI path yet; see [Roadmap](#-roadmap)) |
 
 ## 📊 Benchmarks
 
@@ -81,7 +125,9 @@ results by ±20%, so alternating measurements are the only fair comparison):
 
 ### The optimisation arc
 
-Every step below is a measured node-time change, verified bit-identical:
+Every step below is a measured node-time change, verified to leave the
+engine's own output unchanged relative to the previous build (the
+engine-vs-ORT correctness audit is in the report's §10):
 
 | Stage | 512×512 total | What landed |
 |---|---|---|
@@ -123,19 +169,25 @@ Every step below is a measured node-time change, verified bit-identical:
 | **M4 — Profile & fix the 75%** | Three ConvTranspose nodes were 75% of runtime → direct kernel + AVX2 → 15.5 s |
 | **M5 — Systematic campaign** | 13 fixes across conv/GEMM/shape ops, each profiled and A/B verified → 3.93 s |
 | **M6 — Pass ORT** | Interleaved A/B: **1.92x faster than ONNX Runtime**, 4.7 MB vs 24.3 MB |
-| **M7 — Harden & vendor** | Engine vendored with Apache-2.0 notices, 472 unit tests, cache revisioning, ORT strategy audit ([docs/ORT_STRATEGIES.md](docs/ORT_STRATEGIES.md)) |
-| **M8 — Next** | GIMP plug-in wiring + large-image ROI path (see [Roadmap](#-roadmap)) |
+| **M7 — Harden & vendor** | Engine vendored with Apache-2.0 notices, unit-test suite, cache revisioning, ORT strategy audit ([docs/ORT_STRATEGIES.md](docs/ORT_STRATEGIES.md)) |
+| **M8 — GIMP bridge adopted** | Front-end ported into [`gimp/`](gimp): side-by-side `plug-in-lama-oxionnx`, installer, model/cache handling. Next: large-image ROI path + remaining wiring (see [Roadmap](#-roadmap)) |
+| **M9 — Correctness audit** | White-mask bug (missing /255) fixed; tap-level differential testing against ORT exposed and fixed 3 engine kernel bugs + 1 fallback bug; regression tests added ([report §10](docs/OXIONNX_REPORT.md#10-correctness-audit-2026-09-14)) |
 
 ## 🧪 Validation
 
-- **472 unit tests** in the vendored engine (`cargo test --release --features simd --lib`).
-- **Bit-identical output** against the original engine on three reference
-  images (512×512 synthetic, 800×600 photo-like, 1000×700 mod-16 edge case):
-  max per-channel difference **0**.
+- **955 tests** in the vendored engine (60 test binaries,
+  `cargo test --release --features simd`), including regression tests for the
+  three kernel bugs fixed in the correctness audit.
+- **Differential verification against ONNX Runtime**: a tap-level harness
+  ([`tools/tap_diff.py`](tools/tap_diff.py)) diffs every sampled intermediate
+  tensor against ORT under `OXIONNX_OPT_LEVEL=none` — float tensors agree to
+  ≤4e-4, 8-bit outputs to ≤1 LSB on the reference fixtures (512×512
+  synthetic, 800×600 photo-like, 1000×700 mod-16 edge case, and the
+  GIMP-exported bridge inputs). Usage in [tools/README.md](tools/README.md).
 - **Interleaved A/B measurement** for every performance claim, with
   kill switches (`OXIONNX_NO_ADDBN_FUSION`, `OXIONNX_NO_SCRATCH_CACHE`,
-  `OXIONNX_NO_SESSION_CACHE`) so any optimisation can be turned off and
-  re-measured in the same binary.
+  `OXIONNX_NO_SESSION_CACHE`, `OXIONNX_OPT_LEVEL`) so any behaviour can be
+  turned off and re-measured in the same binary.
 - **Session-cache integrity**: cache file names embed a revision plus the
   model's size/mtime, and are written atomically — a stale or truncated cache
   is never loaded.
@@ -145,8 +197,10 @@ Every step below is a measured node-time change, verified bit-identical:
 - [ ] **Large-image ROI path** — above 4 MP, switch to
       bbox → context-pad → crop, as the ORT/Python workers do; today the
       worker runs the whole image at native resolution.
-- [ ] **GIMP plug-in wiring** — installer, `worker_kind: "oxionnx"` in
-      `lama_config.json`, model + cache placement under the GIMP profile.
+- [ ] **GIMP plug-in wiring, rest of it** — the portable bridge and installer
+      are in [`gimp/`](gimp) and install side by side with the ONNX Runtime
+      plug-in (`plug-in-lama-oxionnx`); left to do: a worker-selection
+      option in the existing plug-in's `lama_config.json`, and packaging.
 - [ ] **Worker-level integration tests** — spawn the binary, assert
       RGBA/alpha/size behaviour, mirroring the ORT worker's
       `tests/integration.rs`.
@@ -163,11 +217,20 @@ Every step below is a measured node-time change, verified bit-identical:
 ├── src/
 │   ├── main.rs                 the worker: CLI, image IO, pre/post, cache
 │   └── bin/bench_gemm.rs       GEMM microbenchmark used during profiling
+├── gimp/                       the GIMP front-end (Python bridge + installer)
+│   ├── README.md               bridge docs, debugging, headless GIMP recipe
+│   ├── lama-oxionnx.py         plug-in: GEGL glue, worker spawn, shadow buffer
+│   ├── install.bat             per-user installer (interpreter alias, model, worker)
+│   └── gimp-verbose.bat        launch GIMP with a console + show the log
+├── tools/
+│   ├── tap_diff.py             tap-level differential harness (OxiONNX vs ORT)
+│   └── README.md               how to localise an engine divergence
 ├── vendor/oxionnx/             vendored OxiONNX 0.1.7 (Apache-2.0)
 │   └── MODIFICATIONS.md        the fork record: changes, impacts, reverts
 ├── docs/
-│   ├── OXIONNX_REPORT.md       evaluation + optimisation report (the long read)
-│   └── ORT_STRATEGIES.md       audit of onnxruntime-main: adopted / rejected / v2
+│   ├── OXIONNX_REPORT.md       evaluation + optimisation + correctness audit (§10)
+│   ├── ORT_STRATEGIES.md       audit of onnxruntime-main: adopted / rejected / v2
+│   └── GIMP_NOTES.md           GIMP-side lessons (adopted from the ORT plug-in repo)
 └── test_data/                  six input fixtures (generated outputs gitignored)
 ```
 
@@ -195,6 +258,13 @@ Optional environment switches, all off by default:
 | `OXIONNX_NO_SESSION_CACHE=1` | disable the `save_optimized` session cache |
 | `OXIONNX_NO_ADDBN_FUSION=1` | disable the `fuse_add_batchnorm` graph fold |
 | `OXIONNX_NO_SCRATCH_CACHE=1` | allocate a fresh im2col buffer per convolution |
+| `OXIONNX_OPT_LEVEL=none\|basic\|extended\|all` | force a graph optimisation level (pair with `OXIONNX_NO_SESSION_CACHE=1`); used for numerical bisection |
+| `LAMA_OXIONNX_DUMP_TAPS=<dir>` | dump every graph output as raw f32 + shape (used with a tap-augmented model for the ORT differential harness) |
+
+Two more switches live in the GIMP bridge (`gimp/lama-oxionnx.py`):
+`LAMA_OXIONNX_WORKER` (use a development worker build) and
+`LAMA_OXIONNX_DEBUG_DIR` (keep copies of the exchanged image/mask/result
+PNGs).
 
 ## 🤝 Acknowledgements
 

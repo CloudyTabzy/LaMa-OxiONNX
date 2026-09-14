@@ -10,7 +10,11 @@ It covers the two phases of the work:
    binary, how fast is it, and what does the CUDA path do (September 2026).
 2. **Optimisation** — a per-node profiling campaign that took the same
    workload from 48.3 s to 3.93 s, ending **1.92x faster than ONNX Runtime's
-   CPU path** on the same machine with bit-identical 8-bit output.
+   CPU path** on the same machine. The output initially differed from ORT in
+   the masked region — first taken for normal engine variance, later shown by
+   the [correctness audit](#10-correctness-audit-2026-09-14) to be four real
+   bugs in the fork's kernels. After those fixes the engines agree to ≤4e-4
+   on float tensors and ≤1 LSB on 8-bit output.
 
 The evaluation phase was posted upstream to the maintainer in
 [cool-japan/oxionnx#4](https://github.com/cool-japan/oxionnx/issues/4)
@@ -38,10 +42,11 @@ ONNX-Runtime sidecar) and ran three reference images through both engines.
 
 **The unmasked region is bit-identical** (mean and max diff 0.0000) in all
 three tests: outside the inpainting mask the two engines agree perfectly.
-The masked region diverges, which is expected — LaMa *synthesises* that
-region, so two different inference engines produce two different (and
-equally valid) inpaintings. This is not an accuracy regression; it is the
-nature of generative inpainting.
+The masked region diverged — initially read as expected engine variance,
+since LaMa *synthesises* that region. The [correctness audit](#10-correctness-audit-2026-09-14)
+later proved that divergence was a set of real bugs (the masked output was
+saturated white), not synthesis noise; with those fixed, the two engines
+produce the same inpaint.
 
 The model loads and executes end to end. The upstream `Slice` fix (negative
 `starts[i]`/`ends[i]` via `saturating_add(dim)`) is confirmed working: the 98
@@ -129,13 +134,17 @@ vectorisation, no parallelism and no tiling.
 | model.30 (128→256, 128→64 ch) | 6,658 ms | 1,082 ms | 6.2x |
 | **Total** | **27,967 ms** | **4,890 ms** | **5.7x** |
 
-That single change took the full run from 48.3 s to 15.5 s, bit-identical.
+That single change took the full run from 48.3 s to 15.5 s, with the engine's
+own output unchanged (all bit-identity claims in this section compare each
+build against the previous one; the engine-vs-ORT audit is in §10).
 
 ## 6. The optimisation campaign
 
 Eleven pathologies, found in this order by profiling, GEMM-shape
-instrumentation, and microbenchmarks. Every row is bit-identical in output;
-every row was verified with the profiler and an image diff.
+instrumentation, and microbenchmarks. Every row was verified with the
+profiler and an image diff against the previous build — bit-identical by
+construction. (This checked optimisation-preservation only; the §10 audit is
+what caught the kernel bugs some of these rewrites had introduced.)
 
 | # | Pathology | Fix | Impact |
 |---|---|---|---|
@@ -185,8 +194,12 @@ Six interleaved A/B rounds, same minutes, to control for thermal state:
 | **Average** | **7.57 s** | **3.95 s** |
 
 **OxiONNX is 1.92x faster than ORT** on this workload, wins every
-interleaved round, ships in a 4.7 MB binary versus 24.3 MB, and produces
-bit-identical 8-bit output (max diff 0) on all three reference images.
+interleaved round, and ships in a 4.7 MB binary versus 24.3 MB. (The output
+comparison in those rounds only checked the unmasked region and surfaces
+that the composite replaces outside the mask; the masked region was broken
+by the bugs the [correctness audit](#10-correctness-audit-2026-09-14) later
+found and fixed. With the fixed engine the same A/B still holds — the fixes
+cost no measurable time.)
 
 The remaining node-execution profile (3,527 ms total) is headed by
 `Conv` (~1,280 ms, of which the 3×3 im2col gathers and GEMMs are the bulk),
@@ -234,3 +247,137 @@ clamped, not `Pad` leniency), fixed it in 0.1.5, and additionally hardened the
 legacy opset ≤ 10 `Pad` attribute form for 0.1.8. The length-normalisation
 part of our patch was correctly declined as symptom-treatment. The vendored
 fork here carries only performance work; the correctness fixes are upstream's.
+
+---
+
+## 10. Correctness audit (2026-09-14)
+
+After the GIMP bridge was installed and exercised, the inpainting result in
+GIMP came back as a **white rectangle** inside the selection. That report
+unwound into two layers of problems.
+
+### 10.1 The white output: a worker port bug
+
+The LaMa model outputs **0–255** floats; both the reference Python worker and
+the ORT worker divide by 255 before compositing. The OxiONNX worker — ported
+from that contract — **skipped the division**, so every model output value
+above 1.0 clamped to white in the masked region. Outside the mask the
+soft-mask composite restores the original pixels, which is why every unmasked
+comparison (and every earlier "bit-identical" check between OxiONNX builds)
+looked perfect while the masked content was broken. Fixed in the worker
+(`out_hwc = raw * 1/255`).
+
+Once the scaling was fixed, the masked content appeared — but it did **not**
+match ORT.
+
+### 10.2 The remaining divergence: four engine bugs
+
+Method: build a **tap-augmented model** (every N-th node output promoted to a
+graph output), run ORT (optimisations disabled) and OxiONNX
+(`OXIONNX_OPT_LEVEL=none`) on identical inputs, and diff tensor by tensor.
+The first divergent node localises the bug; the diff structure (which
+rows/columns/positions) then identifies it. Then hand-compute the expected
+value from the model weights to confirm.
+
+The audit found four bugs, all introduced by the fork's optimisation work
+(none present upstream — and all invisible to the earlier self-referential
+comparisons):
+
+| # | Where | Bug | Symptom |
+|---|---|---|---|
+| 1 | `oxionnx-ops/src/conv/transpose.rs` (both AVX2 s2k3 kernels) | On odd output rows the **ky=0 and ky=2 weight sets were paired with the wrong input rows** (the two row vectors were swapped) | All odd output rows of every ConvTranspose wrong by ~5–10% |
+| 2 | same file | On the **last output row** the ky=0 input row is `(oy+1)/2 == h` and does not exist; the SIMD path read **out of bounds** and used the garbage | Last row wildly wrong (up to ~2000) |
+| 3 | `oxionnx-ops/src/conv/conv2d.rs` (`conv2d_direct_small_m_f32`) | The direct small-M kernel indexed weights as **`[c_in][c_out][k][k]`** instead of ONNX `[c_out][c_in][k][k]` | The final 7×7 conv (→ sigmoid → mask multiply) wrong everywhere; the whole masked region off by ~10% |
+| 4 | `transpose.rs` (`try_convtranspose_as_conv` fallback) | Passed the **original stride** to the inner convolution (the zero-interleaved input already encodes it → output size shrank and the copy-back panicked), and never **flipped the kernel** spatially | Any non-s2k3 ConvTranspose crashed or mis-computed (pre-existing; surfaced by the engine test suite) |
+
+Fixes: correct the u/v weight pairing; route the bottom row through the
+bounds-checked scalar tail; fix the small-M weight layout (both SIMD loops
+and the scalar tail); use stride 1 + spatial kernel flip in the fallback.
+
+### 10.3 Verification after the fixes
+
+- **Tap-level**: all sampled intermediate tensors agree with ORT to ≤4e-4
+  (max over 17478-node graph; most taps ≤1e-6). Final model output max diff
+  4e-4 out of 0–255.
+- **End-to-end 8-bit**: the 512×512 fixture pair is **bit-identical** to ORT
+  inside and outside the mask; the 800×600 GIMP-exported input differs by at
+  most **1 LSB** inside the mask (mean 0.00), 0 outside.
+- **Engine test suite**: 955 tests across 60 binaries pass, including new
+  regression tests that compare the s2k3 fast path, the fallback, and the
+  small-M conv against naive reference implementations with asymmetric
+  weights and odd-dimension cases.
+- **Performance**: unchanged — the fixes touch indexing and one scalar tail
+  row per ConvTranspose plane; interleaved measurement still shows ~4.2 s vs
+  ORT's ~10 s on the same session.
+
+### 10.4 Lessons learned
+
+These are the durable lessons from the mistake, recorded so the same class of
+failure is caught much earlier next time.
+
+**1. Self-consistent is not correct — never validate an engine against
+itself.** The whole optimisation campaign compared each build against the
+previous OxiONNX build ("output unchanged"). That test can only prove an
+optimisation *preserved* behaviour; it can never prove the behaviour was
+right. A wrong engine passes it forever. Every kernel change needs at least
+one comparison against an **independent** implementation (ORT here).
+
+**2. Choose comparison regions that can actually fail.** The soft-mask
+composite replaces everything outside the mask with the original pixels, so
+the unmasked region is *always* bit-identical no matter how broken the model
+output is. And the missing `÷255` saturated the masked region to white, which
+swamped every other error. The only region with real signal was the masked
+region — and that was the one region the original A/B numbers never checked
+visually. Rule: when validating an inpainting pipeline, inspect the
+synthesised content explicitly, and compare the **raw model output** (before
+compositing) whenever possible.
+
+**3. Port contracts must be verified line by line.** The `÷255` existed in
+both reference workers (Python and ORT); the port dropped it silently and
+nothing in the fork ever looked at model-output magnitudes. When porting an
+op or a worker, diff the data-flow contract against the reference
+implementation: input scaling, output scaling, masks, alpha, colour order,
+layout.
+
+**4. Optimised kernels break at parity and boundary cases, not in the
+middle.** The three kernel bugs were: odd output *parity rows* (ConvTranspose
+weight pairing), the *last* row (out-of-bounds ky=0 tap), and a *layout*
+assumption (small-M weight indexing `[ci][co]` vs ONNX `[co][ci]`). Symmetric
+or interior-only test data passes all three. Regression tests must use
+asymmetric weights, odd dimensions, and explicitly include first/last
+rows/columns.
+
+**5. Differential testing localises the bug in minutes.** The tap harness
+(every N-th node output promoted to a graph output, both engines run with
+optimisations off, tensors diffed in evaluation order) reduced a
+17,480-node graph to a single first-divergent node in two bisection rounds;
+hand-computing the expected values from the weights then identified the
+exact index error. This, not guesswork, is the tool for any future "engine X
+disagrees with engine Y" problem — the reusable implementation lives in
+[`tools/tap_diff.py`](../tools/tap_diff.py) with usage in
+[`tools/README.md`](../tools/README.md).
+
+**6. Know your tolerance budget — and what exceeds it.** Accumulation-order
+differences across a 17k-node network give ~1e-6 per tap and ≤1 LSB at
+8-bit; anything at 1e-2 or above is a bug, not noise. The audit's first
+divergent node differed by 3158, four orders of magnitude above noise — an
+obvious bug once measured, invisible while unmeasured.
+
+**7. Put the debug artifacts where the failure happens.** The exchanged
+image/mask/result PNGs are deleted with the temp directory after every
+run — which is exactly when you need them. The bridge now keeps copies with
+`LAMA_OXIONNX_DEBUG_DIR` set, and the whole GIMP path is exercisable
+headlessly in batch mode (see [`gimp/README.md`](../gimp/README.md)). The
+white rectangle was reproduced and diagnosed in one such run.
+
+**8. A cheap invariant would have caught the white bug on day one.** A
+worker-side sanity check — "if every masked pixel is saturated, fail or
+warn" — is three lines and would have surfaced the missing `÷255`
+immediately, before any performance work. Cheap invariants beat expensive
+archaeology.
+
+**9. State coverage when claiming verification.** "Verified" without saying
+*what was covered* is how a broken build reads as done for a whole session.
+The claim "all three reference images bit-identical" was true and vacuous at
+the same time: bit-identical **to the previous OxiONNX build**, in the one
+region the composite guaranteed anyway.

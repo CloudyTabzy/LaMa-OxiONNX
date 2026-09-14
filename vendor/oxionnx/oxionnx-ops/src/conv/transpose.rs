@@ -511,8 +511,9 @@ fn convtranspose_s2k3_plane_rows(
 /// Tap tables for stride 2, kernel 3, pad 1 (output `oy`/`ox` parity `py`/`px`):
 ///   even row (`ky=1`, input `iy=oy/2`):
 ///     even ox (`kx=1`): `ix=(ox)/2`;  odd ox: `kx=0 → ix=(ox+1)/2`, `kx=2 → ix=(ox-1)/2`
-///   odd row (`ky=0 → iy=(oy+1)/2`, `ky=2 → iy=(oy-1)/2`): same column pattern
-///    applied to both input rows.
+///   odd row: `ky=0` reads input `iy=(oy+1)/2` (loaded as `v`), `ky=2` reads
+///    `iy=(oy-1)/2` (loaded as `u`); same column pattern on both rows, with
+///    the ky=0 weights (`+0..+2`) on `v` and ky=2 (`+6..+8`) on `u`.
 #[cfg(target_arch = "x86_64")]
 #[target_feature(enable = "avx2,fma")]
 #[allow(clippy::too_many_arguments)]
@@ -546,6 +547,30 @@ unsafe fn convtranspose_s2k3_plane_rowwise(
     for oy in oy0..oy1 {
         let even_row = oy % 2 == 0;
         let ow_row = oy * ow;
+
+        // Bottom edge: on the last odd row the ky=0 input row `(oy+1)/2` is
+        // `h`, which does not exist. The SIMD path would read past the plane
+        // and use it as if it were real, so that one row goes through the
+        // bounds-checking scalar tail instead.
+        if !even_row && (oy + 1) / 2 >= h {
+            convtranspose_row_tail(
+                input,
+                weight,
+                in_batch_base,
+                w_co_base,
+                c_in,
+                h,
+                w,
+                ow,
+                in_plane,
+                w_ci_stride,
+                oy,
+                0,
+                false,
+                out_slice,
+            );
+            continue;
+        }
 
         // Full 16-wide blocks. A block needs input columns [ix0, ix0+9) for
         // the plain loads; the final block (ix0 + 8 == w) uses a shuffled
@@ -597,7 +622,9 @@ unsafe fn convtranspose_s2k3_plane_rowwise(
                         _mm256_loadu_ps(in_b.add(1))
                     };
 
-                    // ky=0 row (offset +0..+2), ky=2 row (offset +6..+8)
+                    // Odd rows: `v` is the ky=0 input row ((oy+1)/2), `u` the
+                    // ky=2 row ((oy-1)/2). Pair each row with its own kernel
+                    // rows: ky=0 weights (+0..+2) for v, ky=2 (+6..+8) for u.
                     let w00 = _mm256_broadcast_ss(&*wb.add(0));
                     let w01 = _mm256_broadcast_ss(&*wb.add(1));
                     let w02 = _mm256_broadcast_ss(&*wb.add(2));
@@ -605,12 +632,12 @@ unsafe fn convtranspose_s2k3_plane_rowwise(
                     let w21 = _mm256_broadcast_ss(&*wb.add(7));
                     let w22 = _mm256_broadcast_ss(&*wb.add(8));
 
-                    acc_e = _mm256_fmadd_ps(u0, w01, acc_e);
-                    acc_e = _mm256_fmadd_ps(v0, w21, acc_e);
-                    acc_o1 = _mm256_fmadd_ps(u1, w00, acc_o1);
-                    acc_o2 = _mm256_fmadd_ps(u0, w02, acc_o2);
-                    acc_o3 = _mm256_fmadd_ps(v1, w20, acc_o3);
-                    acc_o4 = _mm256_fmadd_ps(v0, w22, acc_o4);
+                    acc_e = _mm256_fmadd_ps(u0, w21, acc_e);
+                    acc_e = _mm256_fmadd_ps(v0, w01, acc_e);
+                    acc_o1 = _mm256_fmadd_ps(u1, w20, acc_o1);
+                    acc_o2 = _mm256_fmadd_ps(u0, w22, acc_o2);
+                    acc_o3 = _mm256_fmadd_ps(v1, w00, acc_o3);
+                    acc_o4 = _mm256_fmadd_ps(v0, w02, acc_o4);
                 }
             }
 
@@ -709,6 +736,45 @@ unsafe fn convtranspose_s2k3_plane2_rowwise(
             ((oy + 1) / 2, (oy - 1) / 2)
         };
 
+        // Bottom edge: on the last odd row the ky=0 input row `(oy+1)/2` is
+        // `h` and does not exist; use the bounds-checking scalar tail for it
+        // instead of reading past the plane.
+        if !even_row && iy_a >= h {
+            convtranspose_row_tail(
+                input,
+                weight,
+                in_batch_base,
+                w_co_base,
+                c_in,
+                h,
+                w,
+                ow,
+                in_plane,
+                w_ci_stride,
+                oy,
+                0,
+                false,
+                out_a,
+            );
+            convtranspose_row_tail(
+                input,
+                weight,
+                in_batch_base,
+                w_co_base + 9,
+                c_in,
+                h,
+                w,
+                ow,
+                in_plane,
+                w_ci_stride,
+                oy,
+                0,
+                false,
+                out_b,
+            );
+            continue;
+        }
+
         let mut ix0 = 0usize;
         while ix0 + 8 <= w && ix0 * 2 + 16 <= ow {
             let last = ix0 + 8 == w;
@@ -752,12 +818,13 @@ unsafe fn convtranspose_s2k3_plane2_rowwise(
                         let w20 = _mm256_broadcast_ss(&*wb.add(6));
                         let w21 = _mm256_broadcast_ss(&*wb.add(7));
                         let w22 = _mm256_broadcast_ss(&*wb.add(8));
-                        a_e[ch] = _mm256_fmadd_ps(u0, w01, a_e[ch]);
-                        a_e[ch] = _mm256_fmadd_ps(v0, w21, a_e[ch]);
-                        a_o1[ch] = _mm256_fmadd_ps(u1, w00, a_o1[ch]);
-                        a_o2[ch] = _mm256_fmadd_ps(u0, w02, a_o2[ch]);
-                        a_o3[ch] = _mm256_fmadd_ps(v1, w20, a_o3[ch]);
-                        a_o4[ch] = _mm256_fmadd_ps(v0, w22, a_o4[ch]);
+                        // `v` is the ky=0 row, `u` the ky=2 row.
+                        a_e[ch] = _mm256_fmadd_ps(u0, w21, a_e[ch]);
+                        a_e[ch] = _mm256_fmadd_ps(v0, w01, a_e[ch]);
+                        a_o1[ch] = _mm256_fmadd_ps(u1, w20, a_o1[ch]);
+                        a_o2[ch] = _mm256_fmadd_ps(u0, w22, a_o2[ch]);
+                        a_o3[ch] = _mm256_fmadd_ps(v1, w00, a_o3[ch]);
+                        a_o4[ch] = _mm256_fmadd_ps(v0, w02, a_o4[ch]);
                     }
                 }
             }
@@ -997,13 +1064,19 @@ fn try_convtranspose_as_conv(
     }
 
     // Transpose weight from [C_in, C_out, kH, kW] to [C_out, C_in, kH, kW]
+    // and flip the kernel spatially: ConvTranspose over a zero-interleaved
+    // input equals a regular convolution with the spatially reversed kernel.
     let mut conv_weight = vec![0.0_f32; weight.len()];
     for ci in 0..c_in {
         for co in 0..c_out {
             let src_base = (ci * c_out + co) * kh * kw;
             let dst_base = (co * c_in + ci) * kh * kw;
-            conv_weight[dst_base..dst_base + kh * kw]
-                .copy_from_slice(&weight[src_base..src_base + kh * kw]);
+            for ky in 0..kh {
+                for kx in 0..kw {
+                    conv_weight[dst_base + (kh - 1 - ky) * kw + (kw - 1 - kx)] =
+                        weight[src_base + ky * kw + kx];
+                }
+            }
         }
     }
 
@@ -1016,11 +1089,14 @@ fn try_convtranspose_as_conv(
         shape: vec![c_out, c_in, kh, kw],
     };
 
+    // Stride 1: the upsampling is already encoded in the zero-interleaved
+    // input (elements spaced `s` apart); the padding `k-1-p` completes the
+    // equivalence.
     let conv_result = super::conv2d::conv2d(
         &zp_tensor,
         &w_tensor,
         None,
-        [s_h, s_w],
+        [1, 1],
         [conv_pad_h, conv_pad_w, conv_pad_h, conv_pad_w],
         [1, 1],
         1,

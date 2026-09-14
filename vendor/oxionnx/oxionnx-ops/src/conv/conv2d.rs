@@ -1378,7 +1378,10 @@ unsafe fn conv2d_direct_small_m_f32(
                             let v0 = _mm256_loadu_ps(input.as_ptr().add(row + kx));
                             let v1 = _mm256_loadu_ps(input.as_ptr().add(row + kx + 8));
                             let v2 = _mm256_loadu_ps(input.as_ptr().add(row + kx + 16));
-                            let w_base = ci * c_out * kh * kw + ky * kw + kx;
+                            // Weight layout is ONNX `[c_out][c_in][kh][kw]`,
+                            // so the per-output-channel stride is
+                            // `c_in*kh*kw`, not `kh*kw`.
+                            let w_base = ci * kh * kw + ky * kw + kx;
                             // co = 0
                             if c_out > 0 {
                                 let ws = _mm256_broadcast_ss(&weight[w_base]);
@@ -1388,7 +1391,7 @@ unsafe fn conv2d_direct_small_m_f32(
                             }
                             if c_out > 1 {
                                 let ws = _mm256_broadcast_ss(
-                                    &weight[w_base + kh * kw],
+                                    &weight[w_base + c_in * kh * kw],
                                 );
                                 acc1[0] = _mm256_fmadd_ps(v0, ws, acc1[0]);
                                 acc1[1] = _mm256_fmadd_ps(v1, ws, acc1[1]);
@@ -1396,7 +1399,7 @@ unsafe fn conv2d_direct_small_m_f32(
                             }
                             if c_out > 2 {
                                 let ws = _mm256_broadcast_ss(
-                                    &weight[w_base + 2 * kh * kw],
+                                    &weight[w_base + 2 * c_in * kh * kw],
                                 );
                                 acc2[0] = _mm256_fmadd_ps(v0, ws, acc2[0]);
                                 acc2[1] = _mm256_fmadd_ps(v1, ws, acc2[1]);
@@ -1447,17 +1450,17 @@ unsafe fn conv2d_direct_small_m_f32(
                         let row = in_ch + (oy + ky) * w + ox;
                         for kx in 0..kw {
                             let v0 = _mm256_loadu_ps(input.as_ptr().add(row + kx));
-                            let w_base = ci * c_out * kh * kw + ky * kw + kx;
+                            let w_base = ci * kh * kw + ky * kw + kx;
                             if c_out > 0 {
                                 let ws = _mm256_broadcast_ss(&weight[w_base]);
                                 acc0 = _mm256_fmadd_ps(v0, ws, acc0);
                             }
                             if c_out > 1 {
-                                let ws = _mm256_broadcast_ss(&weight[w_base + kh * kw]);
+                                let ws = _mm256_broadcast_ss(&weight[w_base + c_in * kh * kw]);
                                 acc1 = _mm256_fmadd_ps(v0, ws, acc1);
                             }
                             if c_out > 2 {
-                                let ws = _mm256_broadcast_ss(&weight[w_base + 2 * kh * kw]);
+                                let ws = _mm256_broadcast_ss(&weight[w_base + 2 * c_in * kh * kw]);
                                 acc2 = _mm256_fmadd_ps(v0, ws, acc2);
                             }
                         }
@@ -1496,7 +1499,7 @@ unsafe fn conv2d_direct_small_m_f32(
                             let row = in_ch + (oy + ky) * w + ox;
                             for kx in 0..kw {
                                 acc += input[row + kx]
-                                    * weight[ci * c_out * kh * kw + co * kh * kw + ky * kw + kx];
+                                    * weight[co * c_in * kh * kw + ci * kh * kw + ky * kw + kx];
                             }
                         }
                     }
