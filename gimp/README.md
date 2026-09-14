@@ -39,9 +39,33 @@ then restart GIMP and use **Filters → Enhance → LaMa Inpaint (OxiONNX)...**.
 | `LAMA_OXIONNX_DEBUG_DIR` | keep copies of the exchanged `image.png` / `mask.png` / `result.png` |
 | `LAMA_OXIONNX_MAX_PIXELS` | override the 4 MP native-resolution guard (default 4,000,000) |
 
+## Log and per-run profiling
+
 The plug-in writes a rotating 200-line log to `lama.log` next to itself
-(`%APPDATA%\GIMP\3.2\plug-ins\lama-oxionnx\lama.log`). The log records the
-worker path, the worker's `[LAMA_MARKER]` timing line, and any error path.
+(`%APPDATA%\GIMP\3.2\plug-ins\lama-oxionnx\lama.log`). Every successful run
+adds a `worker:` line plus two `profile:` lines that account for the whole
+round trip:
+
+```
+[00:02:56] profile: worker decode_ms=18 preprocess_ms=1 load_ms=305 run_ms=8886 compose_ms=5 write_ms=9 total_ms=9227
+[00:02:57] profile: bridge export_ms=122 mask_ms=23 worker_wall_ms=9643 import_ms=54 apply_ms=164 total_ms=10034
+```
+
+- **worker** (inside the Rust process): PNG decode, preprocessing, session
+  load (the OxiCache), inference (`run_ms`), output compose, PNG write.
+- **bridge** (inside GIMP): drawable export through GEGL, selection-mask
+  export, the worker's full wall time (spawn → exit), result import into the
+  shadow buffer, and shadow merge + `displays_flush`.
+- `worker_wall_ms − worker.total_ms` is process startup/teardown plus the
+  progress-poll interval — the part that is neither engine nor GIMP work.
+- `bridge.total_ms` is the plug-in's wall time from entry to just after
+  `displays_flush()`. The canvas repaint is *not* included: `gimp-displays-flush`
+  only invalidates the render region (`gimp_display_flush` →
+  `gimp_display_shell_render_invalidate_area` in the GIMP source), and actual
+  rendering happens asynchronously in GIMP's main loop.
+
+Any error path is logged with the reason (worker exit, timeout, dimension
+mismatch, missing model/worker) before the filter returns to GIMP.
 
 ## Debugging
 

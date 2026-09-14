@@ -438,6 +438,13 @@ class LamaOxiONNX(Gimp.PlugIn):
         # checks have all passed, and is always ended in ``finally`` so
         # the GIMP progress bar cannot be left in a half-state on any
         # failure path (timeout, exception, cancelled run).
+        #
+        # Wall-clock profiling: every phase of the round trip is timed
+        # (export, mask, worker, import, apply) and written to the log as
+        # `profile: bridge ...` / `profile: worker ...` lines when the run
+        # completes. GIMP's own repaint after `displays_flush()` happens in
+        # its main loop and is not observable from here.
+        t_run_start = time.monotonic()
         progress_started = False
 
         def _phase(text, fraction):
@@ -522,9 +529,12 @@ class LamaOxiONNX(Gimp.PlugIn):
                     output_path = os.path.join(temp_dir, "result.png")
 
                     _phase("Preparing image...", 0.10)
+                    t = time.monotonic()
                     save_buffer_as_png(drawable.get_buffer(), image_path)
+                    export_ms = int((time.monotonic() - t) * 1000)
 
                     _phase("Exporting mask...", 0.20)
+                    t = time.monotonic()
                     save_drawable_selection_mask(
                         image,
                         drawable,
@@ -532,6 +542,7 @@ class LamaOxiONNX(Gimp.PlugIn):
                         height,
                         mask_path,
                     )
+                    mask_ms = int((time.monotonic() - t) * 1000)
 
                     command = [
                         worker_binary,
@@ -549,9 +560,11 @@ class LamaOxiONNX(Gimp.PlugIn):
                     _log(f"worker: {worker_binary}")
 
                     try:
+                        t = time.monotonic()
                         completed = _run_worker_with_progress(
                             command, _worker_progress_callback
                         )
+                        worker_wall_ms = int((time.monotonic() - t) * 1000)
                     except OSError as exc:
                         return _execution_error(
                             procedure,
@@ -576,11 +589,23 @@ class LamaOxiONNX(Gimp.PlugIn):
                             "The LaMa worker did not create its output PNG.",
                         )
 
-                    # Log the worker's timing marker (load + inference).
+                    # Log the worker's own phase breakdown (decode,
+                    # preprocess, session load, inference, compose, PNG
+                    # write). Older workers only emit the shorter `timing`
+                    # line; fall back to it.
+                    timing_line = None
                     for line in (completed.stdout or "").splitlines():
-                        if "[LAMA_MARKER] timing" in line:
-                            _log(line.strip())
+                        if "[LAMA_MARKER] profile" in line:
+                            _log(
+                                "profile: worker "
+                                + line.split("profile", 1)[1].strip()
+                            )
                             break
+                        if "[LAMA_MARKER] timing" in line:
+                            timing_line = line.strip()
+                    else:
+                        if timing_line:
+                            _log(timing_line)
 
                     # Optional debug copies: keeps the exact PNGs exchanged
                     # with the worker so the pipeline can be inspected
@@ -603,8 +628,11 @@ class LamaOxiONNX(Gimp.PlugIn):
                             _log(f"debug copy failed: {exc}")
 
                     _phase("Applying result...", 0.90)
+                    t = time.monotonic()
                     load_png_into_shadow(drawable, output_path, width, height)
+                    import_ms = int((time.monotonic() - t) * 1000)
 
+                t = time.monotonic()
                 drawable.merge_shadow(True)
                 drawable.update(
                     selection_x,
@@ -613,6 +641,20 @@ class LamaOxiONNX(Gimp.PlugIn):
                     selection_height,
                 )
                 Gimp.displays_flush()
+                apply_ms = int((time.monotonic() - t) * 1000)
+
+                _log(
+                    "profile: bridge export_ms=%d mask_ms=%d worker_wall_ms=%d "
+                    "import_ms=%d apply_ms=%d total_ms=%d"
+                    % (
+                        export_ms,
+                        mask_ms,
+                        worker_wall_ms,
+                        import_ms,
+                        apply_ms,
+                        int((time.monotonic() - t_run_start) * 1000),
+                    )
+                )
             except (OSError, RuntimeError, ValueError) as exc:
                 return _execution_error(procedure, f"LaMa image transfer failed: {exc}")
             except Exception as exc:

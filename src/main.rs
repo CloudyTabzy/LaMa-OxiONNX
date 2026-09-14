@@ -68,6 +68,7 @@ fn run() -> Result<()> {
 }
 
 fn run_inpaint(args: &Args) -> Result<()> {
+    let t_start = Instant::now();
     let image_path = require_file(&args.image, "image")?;
     let mask_path = require_file(&args.mask, "mask")?;
     let model_path = require_file(&args.model, "model")?;
@@ -96,6 +97,7 @@ fn run_inpaint(args: &Args) -> Result<()> {
             mask_h
         );
     }
+    let t_decoded = Instant::now();
 
     // Build the f32 HWC image, the bool HW mask (model input), and the
     // soft f32 HW mask (compositing).
@@ -129,6 +131,8 @@ fn run_inpaint(args: &Args) -> Result<()> {
         }
         arr
     };
+
+    let t_preprocessed = Instant::now();
 
     marker("inference_start");
     let inference_start = Instant::now();
@@ -327,6 +331,9 @@ fn run_inpaint(args: &Args) -> Result<()> {
     // Convert CHW output back to HWC. The LaMa model outputs 0..255; the
     // rest of the pipeline (composite, write) works in 0..1 like the
     // reference Python/ORT workers, which divide by 255 right here.
+    // Extract the model output, crop back to the original size, and blend
+    // with the original. Timed as the `compose` phase in the profile line.
+    let compose_start = Instant::now();
     let out_hwc: Array3<f32> = {
         let inv255 = 1.0f32 / 255.0;
         let mut arr = Array3::<f32>::zeros((out_h, out_w, 3));
@@ -405,9 +412,21 @@ fn run_inpaint(args: &Args) -> Result<()> {
     let result = soft_composite(&image_hwc, &out, &mask_soft);
 
     // Write output PNG, preserving the original alpha channel.
+    let write_start = Instant::now();
     write_output_rgba(&result, &img_rgba_u8, width, height, &output_path)?;
+    let t_end = Instant::now();
 
     marker("result_written");
+    marker_line(&format!(
+        "profile decode_ms={} preprocess_ms={} load_ms={} run_ms={} compose_ms={} write_ms={} total_ms={}",
+        (t_decoded - t_start).as_millis(),
+        (t_preprocessed - t_decoded).as_millis(),
+        load_elapsed.as_millis(),
+        run_elapsed.as_millis(),
+        (write_start - compose_start).as_millis(),
+        (t_end - write_start).as_millis(),
+        (t_end - t_start).as_millis(),
+    ));
     Ok(())
 }
 
@@ -588,6 +607,12 @@ fn write_output_rgba(
 }
 
 fn marker(phase: &str) {
-    eprintln!("[LAMA_MARKER] phase {}", phase);
+    marker_line(&format!("phase {phase}"));
+}
+
+/// Emit an arbitrary `[LAMA_MARKER]` line on stderr and flush it, so the
+/// parent plug-in sees it immediately.
+fn marker_line(text: &str) {
+    eprintln!("[LAMA_MARKER] {text}");
     std::io::stderr().flush().ok();
 }
