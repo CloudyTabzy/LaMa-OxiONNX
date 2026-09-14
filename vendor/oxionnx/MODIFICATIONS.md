@@ -22,8 +22,8 @@ The upstream 0.1.7 engine ran LaMa in ~48 s on the reference machine. The
 upstream issue (<https://github.com/cool-japan/oxionnx/issues/4>) documented
 the model-loading failures we found at 0.1.4 and the upstream fixes; after
 those landed we profiled per-node and patched the hot paths. The fork now
-runs the same graph at ~3.9 s — faster than ONNX Runtime's CPU path
-(7.5 s) on the same machine — with output verified against ONNX Runtime
+runs the same graph at ~3.5 s — faster than ONNX Runtime's CPU path
+(~7.4 s) on the same machine — with output verified against ONNX Runtime
 (≤4e-4 on float tensors, ≤1 LSB on 8-bit results). See the *Correctness
 fixes* section below: the first round of performance rewrites introduced
 four kernel bugs that only a tensor-level comparison against ORT could

@@ -31,7 +31,7 @@ faster than the ONNX Runtime worker, with output that matches ONNX Runtime
   harness compares every sampled intermediate tensor against ONNX Runtime;
   after the fixes in the [correctness audit](docs/OXIONNX_REPORT.md#10-correctness-audit-2026-09-14)
   the engines agree to ≤4e-4 in float and ≤1 LSB in the 8-bit composite.
-- **12.3x faster than stock OxiONNX 0.1.7** (48.3 s → 3.93 s) — the speed came
+- **~14x faster than stock OxiONNX 0.1.7** (48.3 s → ~3.5 s) — the speed came
   from profiling and fixing a handful of pathological code paths, not from
   swapping engines (see [Benchmarks](#-benchmarks) and
   [docs/OXIONNX_REPORT.md](docs/OXIONNX_REPORT.md)).
@@ -120,6 +120,9 @@ results by ±20%, so alternating measurements are the only fair comparison):
 
 `512×512 input · Intel i7-13620H · Rust 1.94 · same model file`
 
+Re-measured after the final layout/slot pass (arc below): **ORT 7.40 s →
+OxiONNX 3.75 s (1.97x)** — three interleaved rounds on the same fixture.
+
 ### Binary size
 
 | Worker | Size | Dependencies |
@@ -153,16 +156,23 @@ engine-vs-ORT correctness audit is in the report's §10):
 
 ### Where the time goes now
 
+`OXIONNX_PROFILE=1` node totals on the final build, 512×512 (thermals move
+these by ±20%; parallel node time sums above the ~3.5 s wall clock):
+
 | Op | Time | Note |
 |---|---|---|
-| Conv (222 nodes) | ~1,280 ms | im2col + `matrixmultiply`, at its parallel ceiling |
-| Einsum (216) | 355 ms | N-split parallel |
-| Transpose (566) | 250 ms | block-swap decomposition + AVX2 tiles |
-| Slice (1,322) | 212 ms | bulk-copy fast path |
-| Reshape + Concat (2,708) | ~425 ms | memcpy floor |
-| ConvTranspose (3) | 205 ms | row-wise + 2-channel AVX2 |
-| MatMul (216) | ~200 ms | merged-GEMM broadcast folding |
-| everything else | ~600 ms | Pad, Div, BatchNorm, Gather, … |
+| Conv (222 nodes) | ~1,450 ms | im2col + `matrixmultiply` and Winograd paths, at their parallel ceiling |
+| Einsum (216) | ~410 ms | N-split parallel |
+| Concat (1,360) | ~400 ms | single-pass slot writes (2026-09-15 pass) |
+| Transpose (566) | ~340 ms | block-swap decomposition + AVX2 tiles |
+| Slice (1,322) | ~310 ms | bulk-copy fast path |
+| MatMul (216) | ~310 ms | merged-GEMM broadcast folding |
+| Pad (98) | ~240 ms | NCHW reflect fast path |
+| ConvTranspose (3) | ~230 ms | row-wise + 2-channel AVX2 |
+| Div (432) | ~150 ms | broadcast `vdivps` |
+| Reshape (1,348) | ~125 ms | now mostly in-place (was ~340 ms before the final pass) |
+| Gather (396) | ~120 ms | direct slot writes |
+| everything else | ~500 ms | Add, Relu, Sub, Mul, trig, shape ops, … |
 
 ## 🗺️ Milestone history
 
@@ -200,19 +210,20 @@ engine-vs-ORT correctness audit is in the report's §10):
 
 ## 🧭 Roadmap
 
+- [x] **GIMP bridge, installer & worker** — [`gimp/`](gimp) installs
+      `plug-in-lama-oxionnx` side by side with the ONNX Runtime plug-in, and
+      the worker ships with per-run phase profiling and a debug capture mode.
 - [ ] **Large-image ROI path** — above 4 MP, switch to
       bbox → context-pad → crop, as the ORT/Python workers do; today the
-      worker runs the whole image at native resolution.
-- [ ] **GIMP plug-in wiring, rest of it** — the portable bridge and installer
-      are in [`gimp/`](gimp) and install side by side with the ONNX Runtime
-      plug-in (`plug-in-lama-oxionnx`); left to do: a worker-selection
-      option in the existing plug-in's `lama_config.json`, and packaging.
+      worker runs the whole image at native resolution (and refuses > 4 MP).
 - [ ] **Worker-level integration tests** — spawn the binary, assert
       RGBA/alpha/size behaviour, mirroring the ORT worker's
       `tests/integration.rs`.
-- [ ] **v2 engine work** — implicit-GEMM convolution (removes the 19–56 MB
-      im2col matrices) and a stride-based `Tensor` (zero-copy reshape).
-      See [docs/OXIONNX_REPORT.md §9](docs/OXIONNX_REPORT.md).
+- [ ] **v2 engine work** — the layout half is done (in-place reshape family,
+      single-pass sequence ops, no slot zeroing); what remains is
+      implicit-GEMM convolution (removes the 19–56 MB im2col matrices) and
+      the `session.run` execution scaffolding (~27 µs/node over ~9,800
+      nodes). See [docs/OXIONNX_REPORT.md §9](docs/OXIONNX_REPORT.md#9-what-is-left-v2-candidates).
 
 ## 📁 Repository layout
 

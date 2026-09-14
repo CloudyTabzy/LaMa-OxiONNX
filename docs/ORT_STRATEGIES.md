@@ -6,6 +6,12 @@ that apply to our vendored-OxiONNX worker, with a verdict per technique:
 rejected it), or **v2**. File references are to the ORT tree; "ours" means
 `vendor/oxionnx` or the worker.
 
+**Status (2026-09-15):** the two adopted fusions shipped with the fork (see
+[`vendor/oxionnx/MODIFICATIONS.md`](../vendor/oxionnx/MODIFICATIONS.md)).
+The correctness audit and the later layout/slot pass are not part of this
+audit — see [`OXIONNX_REPORT.md`](OXIONNX_REPORT.md) §6 and §10. The *v2*
+items below remain open unless the report says otherwise.
+
 ## 1. MLAS — the SGEMM organisation
 
 What ORT does (`onnxruntime/core/mlas/lib/sgemm.cpp`,
