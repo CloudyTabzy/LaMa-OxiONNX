@@ -1,0 +1,26 @@
+# Build artifacts (including the vendored crate's own builds)
+target/
+**/target/
+
+# Session cache files (multi-hundred-MB) and partial writes
+*.oxicache
+*.tmp
+
+# Models are passed to the worker with --model and never committed
+*.onnx
+
+# Test data: the six input fixtures are committed, everything else in
+# test_data/ is generated (outputs, diffs, profiling CSVs, shape dumps)
+test_data/*
+!test_data/test_image.png
+!test_data/test_mask.png
+!test_data/test_photo.png
+!test_data/test_photo_mask.png
+!test_data/test_odd.png
+!test_data/test_odd_mask.png
+
+# J-space working ledger
+.jspace/
+
+# NOTE: Cargo.lock is intentionally NOT ignored — this is a binary crate and
+# the lockfile is what makes the shipped worker reproducible.

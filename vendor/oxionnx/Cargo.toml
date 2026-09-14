@@ -1,0 +1,201 @@
+[workspace]
+members = ["oxionnx-core", "oxionnx-ops", "oxionnx-proto", "oxionnx-gpu", "oxionnx-cuda", "oxionnx-directml", "oxionnx-coreml"]
+resolver = "2"
+
+[workspace.package]
+version = "0.1.7"
+edition = "2021"
+authors = ["COOLJAPAN OU (Team Kitasan)"]
+license = "Apache-2.0"
+repository = "https://github.com/cool-japan/oxionnx"
+documentation = "https://docs.rs/oxionnx"
+homepage = "https://github.com/cool-japan/oxionnx"
+rust-version = "1.75"
+
+[workspace.dependencies]
+oxionnx-core = { path = "oxionnx-core", version = "0.1.7" }
+ndarray = { version = "0.17" }
+oxionnx-ops = { path = "oxionnx-ops", version = "0.1.7" }
+oxionnx-proto = { path = "oxionnx-proto", version = "0.1.7" }
+oxionnx-gpu = { path = "oxionnx-gpu", version = "0.1.7" }
+oxionnx-cuda = { path = "oxionnx-cuda", version = "0.1.7" }
+oxionnx-directml = { path = "oxionnx-directml", version = "0.1.7" }
+oxionnx-coreml = { path = "oxionnx-coreml", version = "0.1.7" }
+# OxiCUDA stack
+#
+# `default-features = false` here (rather than leaving it unspecified) is load
+# -bearing: Cargo silently ignores a member's `default-features = false` on a
+# `{ workspace = true }` dependency unless the workspace entry itself already
+# says so (empirically verified -- otherwise it just warns and keeps every
+# default feature). oxifft's default features are `["std", "threading"]`, and
+# `threading` (rayon) is a `compile_error!` on wasm32 -- see oxionnx-ops's
+# Cargo.toml, its only consumer, for the per-target feature split this enables.
+# Consequence: any consumer crate writing `oxifft.workspace = true` inherits zero default features and must name the ones it needs explicitly, or it silently gets none.
+oxifft = { version = "0.4.2", default-features = false }
+oxicuda-driver = { version = "0.5.5" }
+oxicuda-memory = { version = "0.5.5" }
+oxicuda-blas = { version = "0.5.5" }
+oxicuda-dnn = { version = "0.5.5" }
+oxicuda-ptx = { version = "0.5.5" }
+oxicuda-launch = { version = "0.5.5" }
+thiserror = "2"
+half = "2.7"
+matrixmultiply = "0.3"
+bytemuck = { version = "1", features = ["derive"] }
+rayon = "1"
+wgpu = { version = "29", features = ["wgsl"] }
+hashbrown = "0.17"
+pollster = "0.4"
+tracing = "0.1"
+criterion = { version = "0.8", features = ["html_reports"] }
+proptest = "1"
+aes-gcm = "0.11"
+memmap2 = "0.9"
+wasm-bindgen = "0.2"
+js-sys = "0.3"
+console_error_panic_hook = "0.1.7"
+# `std::time::Instant`/`SystemTime` panic at runtime on wasm32-unknown-unknown
+# (no OS clock); web-time is a `performance.now()`-backed drop-in used only on
+# that target -- see `time_compat` modules in oxionnx/oxionnx-ops.
+web-time = "1.1.0"
+# Apple platform FFI (CoreML execution provider + smoke-test examples)
+objc2 = "0.6"
+objc2-foundation = "0.3"
+objc2-core-ml = "0.3.2"
+objc2-core-video = "0.3.2"
+block2 = "0.6"
+# Windows platform FFI (DirectML execution provider)
+windows = "0.62"
+
+[package]
+name = "oxionnx"
+version.workspace = true
+edition.workspace = true
+authors.workspace = true
+license.workspace = true
+repository.workspace = true
+documentation.workspace = true
+homepage.workspace = true
+rust-version.workspace = true
+readme = "README.md"
+description = "Pure Rust ONNX inference engine — zero C/C++ dependencies"
+keywords = ["onnx", "inference", "deep-learning", "machine-learning", "pure-rust"]
+categories = ["science", "algorithms"]
+
+# cargo-udeps analyzes the host target; these three are real dependencies of
+# src/wasm.rs but every use is behind `#[cfg(target_arch = "wasm32")]`, so a
+# host-target (e.g. macOS) udeps run never sees them referenced and false-flags
+# them as unused. Confirmed genuinely used (not dead) — see src/wasm.rs.
+[package.metadata.cargo-udeps.ignore]
+normal = ["console_error_panic_hook", "js-sys", "wasm-bindgen"]
+
+[dependencies]
+oxionnx-core = { workspace = true }
+oxionnx-ops = { workspace = true }
+oxionnx-proto = { workspace = true }
+oxionnx-gpu = { workspace = true, optional = true }
+oxionnx-cuda = { workspace = true, optional = true }
+oxionnx-directml = { workspace = true, optional = true }
+oxionnx-coreml = { workspace = true, optional = true }
+half = { workspace = true }
+hashbrown = { workspace = true }
+matrixmultiply = { workspace = true }
+bytemuck = { workspace = true }
+tracing = { workspace = true }
+aes-gcm = { workspace = true, optional = true }
+memmap2 = { workspace = true, optional = true }
+wasm-bindgen = { workspace = true, optional = true }
+js-sys = { workspace = true, optional = true }
+console_error_panic_hook = { workspace = true, optional = true }
+
+wgpu = { workspace = true, optional = true }
+
+[target.'cfg(not(target_arch = "wasm32"))'.dependencies]
+rayon = { workspace = true }
+# Native-only blocking executor for the `gpu` feature's `wgpu` adapter/device
+# requests (see `oxionnx-gpu`'s own `Cargo.toml`, which target-gates it the
+# same way). wasm32 cannot block a thread at all, so a wasm+gpu build must
+# never carry this dependency in the first place, not just avoid calling it.
+pollster = { workspace = true, optional = true }
+
+[target.'cfg(target_arch = "wasm32")'.dependencies]
+web-time = { workspace = true }
+
+[features]
+default = []
+gpu = ["dep:wgpu", "dep:pollster", "oxionnx-gpu"]
+cuda = ["dep:oxionnx-cuda"]
+directml = ["dep:oxionnx-directml"]
+coreml = ["dep:oxionnx-coreml"]
+simd = ["oxionnx-ops/simd"]
+encryption = ["dep:aes-gcm"]
+mmap = ["dep:memmap2", "oxionnx-proto/mmap"]
+wasm = ["dep:wasm-bindgen", "dep:js-sys", "dep:console_error_panic_hook"]
+# Opt-in wasm32 threading: re-enables rayon inside the operator kernels (the
+# 349 GFLOP/frame of conv + GEMM that dominate a browser run). Pure
+# pass-through — this crate's own rayon uses (the per-`Session`
+# `rayon::ThreadPool`, the multi-node scheduler in `session/run/parallel.rs`)
+# stay native-only, because `wasm-bindgen-rayon` owns the *global* pool via
+# `build_global()` and a per-session `ThreadPoolBuilder::build()` cannot be
+# constructed on that target at all. Requires the caller's browser artifact to
+# be built per `oxionnx-ops`'s `wasm-threads` docs (nightly + `-Z build-std` +
+# `+atomics,+bulk-memory`) and to call `initThreadPool()` before inference.
+wasm-threads = ["oxionnx-ops/wasm-threads"]
+ndarray = ["oxionnx-core/ndarray"]
+
+[dev-dependencies]
+criterion = { workspace = true }
+half = { workspace = true }
+proptest = { workspace = true }
+ndarray = { workspace = true }
+
+[target.'cfg(target_os = "macos")'.dev-dependencies]
+objc2 = { workspace = true }
+objc2-foundation = { workspace = true }
+objc2-core-ml = { workspace = true }
+block2 = { workspace = true }
+
+[[example]]
+name = "coreml_arcface_smoke"
+path = "examples/coreml_arcface_smoke.rs"
+
+[[example]]
+name = "coreml_scrfd_smoke"
+path = "examples/coreml_scrfd_smoke.rs"
+
+[[example]]
+name = "coreml_inswapper_smoke"
+path = "examples/coreml_inswapper_smoke.rs"
+
+# [w2-f16] This example calls the GPU-only session API (`run_gpu_async`,
+# `set_f16_compute`, `gpu_resident_bytes`) and `pollster`, all of which arrive
+# with the `gpu` feature — but its source carries no `#[cfg]` of its own, so a
+# plain `cargo clippy --workspace --all-targets` used to try to compile it
+# against a feature-less `Session` and fail with ten resolution errors before
+# it ever reached the crate's own code. Declaring the requirement makes Cargo
+# skip it instead, which is what "this example needs a GPU" actually means.
+#
+# `w3_inswapper_ab` needs no entry: it gates its own `main` on the feature and
+# so compiles (to a one-line message) either way.
+[[example]]
+name = "w2_f16_ab"
+path = "examples/w2_f16_ab.rs"
+required-features = ["gpu"]
+
+[[bench]]
+name = "operators"
+harness = false
+
+[[bench]]
+name = "session"
+harness = false
+
+[[bench]]
+name = "performance"
+harness = false
+
+[profile.dev]
+opt-level = 3
+
+[profile.test]
+opt-level = 3

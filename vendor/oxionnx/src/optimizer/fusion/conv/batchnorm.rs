@@ -1,0 +1,396 @@
+// Modified by the GIMP LaMa inpainting fork of OxiONNX (2026-09): extends fuse_conv_batchnorm to ConvTranspose.
+// See ../../../../MODIFICATIONS.md for the full change list and rationale.
+
+//! Conv + BatchNorm fusion and standalone BatchNorm folding passes.
+
+use crate::graph::{Attributes, Node, OpKind};
+use crate::optimizer::graph_utils::{NameAllocator, TensorUsage};
+use crate::tensor::Tensor;
+use std::collections::{HashMap, HashSet};
+
+/// Conv + BatchNorm fusion
+///
+/// Pattern: node A = `Conv(X, W, B)`, node B = `BatchNorm(A.output, scale, bias, mean, var)`.
+/// Fused: a single Conv with the normalisation baked into its weights and bias.
+///
+/// The Conv output must have exactly one consumer (the BatchNorm) *and* must
+/// not be a declared graph output — the fused node produces only the
+/// BatchNorm's output names, so a Conv output that the model also exports
+/// would stop being produced by anything.
+pub fn fuse_conv_batchnorm(
+    nodes: Vec<Node>,
+    weights: &mut HashMap<String, Tensor>,
+    output_names: &[String],
+) -> Vec<Node> {
+    if nodes.len() < 2 {
+        return nodes;
+    }
+
+    let mut producer: HashMap<String, usize> = HashMap::new();
+    for (i, node) in nodes.iter().enumerate() {
+        for out in &node.outputs {
+            producer.insert(out.clone(), i);
+        }
+    }
+
+    let usage = TensorUsage::new(&nodes, output_names);
+    let mut names = NameAllocator::new(&nodes, weights);
+
+    let mut skip: HashSet<usize> = HashSet::new();
+    let mut replacements: HashMap<usize, Node> = HashMap::new();
+
+    for (i, node) in nodes.iter().enumerate() {
+        if skip.contains(&i) {
+            continue;
+        }
+        if !matches!(node.op, OpKind::BatchNorm) {
+            continue;
+        }
+        if node.inputs.len() < 5 {
+            continue;
+        }
+
+        let conv_tensor = &node.inputs[0];
+        let bn_scale_name = &node.inputs[1];
+        let bn_bias_name = &node.inputs[2];
+        let bn_mean_name = &node.inputs[3];
+        let bn_var_name = &node.inputs[4];
+
+        if !usage.is_fusable_intermediate(conv_tensor) {
+            continue;
+        }
+
+        let conv_idx = match producer.get(conv_tensor) {
+            Some(&idx) => idx,
+            None => continue,
+        };
+        if skip.contains(&conv_idx) || replacements.contains_key(&conv_idx) {
+            continue;
+        }
+
+        // ConvTranspose folds too: its output channel is weight dim 1 (vs
+        // dim 0 for Conv), which the scaling branch below accounts for.
+        let is_deconv = match nodes[conv_idx].op {
+            OpKind::Conv => false,
+            OpKind::ConvTranspose => true,
+            _ => continue,
+        };
+        // A Conv that already carries a fused activation applies it *before*
+        // the BatchNorm; baking the normalisation into its weights would
+        // reorder the two.
+        if !nodes[conv_idx].attrs.s("activation").is_empty() {
+            continue;
+        }
+
+        let bn_scale = match weights.get(bn_scale_name) {
+            Some(t) => t.clone(),
+            None => continue,
+        };
+        let bn_bias = match weights.get(bn_bias_name) {
+            Some(t) => t.clone(),
+            None => continue,
+        };
+        let bn_mean = match weights.get(bn_mean_name) {
+            Some(t) => t.clone(),
+            None => continue,
+        };
+        let bn_var = match weights.get(bn_var_name) {
+            Some(t) => t.clone(),
+            None => continue,
+        };
+        let epsilon = node.attrs.floats.get("epsilon").copied().unwrap_or(1e-5);
+
+        let conv_node = &nodes[conv_idx];
+        if conv_node.inputs.len() < 2 {
+            continue;
+        }
+        let conv_weight_name = &conv_node.inputs[1];
+        let conv_bias_name = conv_node.inputs.get(2).cloned();
+
+        let conv_weight = match weights.get(conv_weight_name) {
+            Some(t) => t.clone(),
+            None => continue,
+        };
+
+        let c_out = bn_scale.data.len();
+        // Every BN parameter is per-output-channel; Conv stores that channel
+        // count in weight dim 0, ConvTranspose in dim 1.  Bail out on any
+        // mismatch rather than indexing out of bounds on a malformed model.
+        let channel_dim = usize::from(is_deconv);
+        if c_out == 0
+            || bn_bias.data.len() != c_out
+            || bn_mean.data.len() != c_out
+            || bn_var.data.len() != c_out
+            || conv_weight.shape.get(channel_dim) != Some(&c_out)
+        {
+            continue;
+        }
+
+        let conv_bias_data = match conv_bias_name.as_ref().and_then(|name| weights.get(name)) {
+            Some(b) if b.data.len() == c_out => b.data.clone(),
+            // An existing bias of the wrong length is a malformed model: fold
+            // nothing rather than guess.
+            Some(_) => continue,
+            None => vec![0.0f32; c_out],
+        };
+
+        let mut fused_weight = conv_weight.data.clone();
+        let mut fused_bias = vec![0.0f32; c_out];
+
+        if is_deconv {
+            // [C_in, C_out, kH, kW]: the per-output-channel block is a run of
+            // kH*kW values, `C_out`-strided inside every input-channel slab.
+            let c_in = conv_weight.shape[0];
+            let run = conv_weight.shape.get(2).copied().unwrap_or(1)
+                * conv_weight.shape.get(3).copied().unwrap_or(1);
+            if run == 0 || conv_weight.data.len() != c_in * c_out * run {
+                continue;
+            }
+            for ci in 0..c_in {
+                for c in 0..c_out {
+                    let inv_std = 1.0 / (bn_var.data[c] + epsilon).sqrt();
+                    let factor = bn_scale.data[c] * inv_std;
+                    let start = (ci * c_out + c) * run;
+                    for w in &mut fused_weight[start..start + run] {
+                        *w *= factor;
+                    }
+                }
+            }
+        } else {
+            let weight_per_channel: usize = conv_weight.data.len() / c_out;
+            for c in 0..c_out {
+                let inv_std = 1.0 / (bn_var.data[c] + epsilon).sqrt();
+                let factor = bn_scale.data[c] * inv_std;
+                let start = c * weight_per_channel;
+                for w in &mut fused_weight[start..start + weight_per_channel] {
+                    *w *= factor;
+                }
+            }
+        }
+
+        for c in 0..c_out {
+            let inv_std = 1.0 / (bn_var.data[c] + epsilon).sqrt();
+            let factor = bn_scale.data[c] * inv_std;
+            fused_bias[c] = (conv_bias_data[c] - bn_mean.data[c]) * factor + bn_bias.data[c];
+        }
+
+        // Key the generated names on the (spec-unique) Conv output tensor, not
+        // on `Node::name`: ONNX allows the latter to be empty or duplicated, so
+        // two unnamed Conv+BN pairs would otherwise overwrite each other's
+        // folded weights.
+        let name_base = match conv_node.outputs.first() {
+            Some(name) if !name.is_empty() => name.clone(),
+            _ => continue,
+        };
+        let fused_weight_name = names.allocate(&name_base, "_fused_weight");
+        let fused_bias_name = names.allocate(&name_base, "_fused_bias");
+        weights.insert(
+            fused_weight_name.clone(),
+            Tensor::new(fused_weight, conv_weight.shape.clone()),
+        );
+        weights.insert(
+            fused_bias_name.clone(),
+            Tensor::new(fused_bias, vec![c_out]),
+        );
+
+        let fused_inputs = vec![
+            conv_node.inputs[0].clone(),
+            fused_weight_name,
+            fused_bias_name,
+        ];
+        let fused_conv = Node {
+            op: if is_deconv { OpKind::ConvTranspose } else { OpKind::Conv },
+            name: format!("{}_fused_convbn", conv_node.name),
+            inputs: fused_inputs,
+            outputs: node.outputs.clone(),
+            attrs: conv_node.attrs.clone(),
+        };
+
+        replacements.insert(conv_idx, fused_conv);
+        skip.insert(i);
+    }
+
+    nodes
+        .into_iter()
+        .enumerate()
+        .filter(|(i, _)| !skip.contains(i))
+        .map(|(i, n)| replacements.remove(&i).unwrap_or(n))
+        .collect()
+}
+
+/// Standalone BatchNormalization folding (inference mode).
+///
+/// When all BatchNorm parameters (scale, bias, mean, var) are known constants
+/// and the BatchNorm node is *not* preceded by a Conv (that case is handled by
+/// `fuse_conv_batchnorm`), fold the normalisation into a Mul + Add pair with
+/// pre-computed constant weights:
+///
+/// ```text
+/// factor = scale / sqrt(var + epsilon)
+/// shift  = bias - mean * factor
+/// y      = factor * x + shift
+/// ```
+///
+/// This eliminates the runtime overhead of computing mean/var lookups and the
+/// sqrt/div at inference time.
+///
+/// `known_shapes` provides the input rank for each tensor name, used to shape
+/// the synthesized `factor`/`shift` constants for proper NumPy broadcasting.
+/// For a `[N, C, H, W]` BN input the constants are emitted as `[1, C, 1, 1]`
+/// so that the synthesized `Mul`/`Add` ops align channel-dim broadcast under
+/// strict NumPy rules.  When the input rank is unknown the fold is skipped:
+/// leaving `BatchNormalization` in place is a perf miss, not a correctness bug.
+pub fn fold_batch_norm_inference(
+    nodes: Vec<Node>,
+    weights: &mut HashMap<String, Tensor>,
+    known_shapes: &HashMap<String, Vec<usize>>,
+) -> Vec<Node> {
+    if nodes.is_empty() {
+        return nodes;
+    }
+
+    let mut producer: HashMap<String, usize> = HashMap::new();
+    for (i, node) in nodes.iter().enumerate() {
+        for out in &node.outputs {
+            producer.insert(out.clone(), i);
+        }
+    }
+
+    let mut names = NameAllocator::new(&nodes, weights);
+
+    let mut skip: HashSet<usize> = HashSet::new();
+    let mut new_nodes: Vec<(usize, Vec<Node>)> = Vec::new();
+
+    for (i, node) in nodes.iter().enumerate() {
+        if skip.contains(&i) {
+            continue;
+        }
+        if !matches!(node.op, OpKind::BatchNorm) {
+            continue;
+        }
+        if node.inputs.len() < 5 {
+            continue;
+        }
+
+        let x_name = &node.inputs[0];
+        let bn_scale_name = &node.inputs[1];
+        let bn_bias_name = &node.inputs[2];
+        let bn_mean_name = &node.inputs[3];
+        let bn_var_name = &node.inputs[4];
+
+        // Skip if preceded by Conv (handled by fuse_conv_batchnorm)
+        if let Some(&prev_idx) = producer.get(x_name) {
+            if matches!(nodes[prev_idx].op, OpKind::Conv) {
+                continue;
+            }
+        }
+
+        // All BN params must be constant weights
+        let bn_scale = match weights.get(bn_scale_name) {
+            Some(t) => t.clone(),
+            None => continue,
+        };
+        let bn_bias = match weights.get(bn_bias_name) {
+            Some(t) => t.clone(),
+            None => continue,
+        };
+        let bn_mean = match weights.get(bn_mean_name) {
+            Some(t) => t.clone(),
+            None => continue,
+        };
+        let bn_var = match weights.get(bn_var_name) {
+            Some(t) => t.clone(),
+            None => continue,
+        };
+
+        let epsilon = node.attrs.floats.get("epsilon").copied().unwrap_or(1e-5);
+        let c_out = bn_scale.data.len();
+
+        // Validate shapes are consistent
+        if c_out == 0
+            || bn_bias.data.len() != c_out
+            || bn_mean.data.len() != c_out
+            || bn_var.data.len() != c_out
+        {
+            continue;
+        }
+
+        // Determine the broadcast-friendly shape for the synthesized constants.
+        // ONNX BatchNormalization input is rank ≥ 2 (`[N, C, ...]`).  To make
+        // the emitted `Mul(X, factor)` and `Add(mul_out, shift)` succeed under
+        // strict NumPy alignment from the trailing dim, factor/shift must be
+        // shaped `[1, C, 1, 1, ...]` matching the input rank.  When the rank
+        // is unknown (no shape inference for this input), we cannot produce a
+        // correct broadcast shape — skip the fold rather than risk emitting a
+        // shape that fails at runtime.
+        let bn_const_shape: Vec<usize> = match known_shapes.get(x_name) {
+            Some(s) if s.len() >= 2 && s[1] == c_out => {
+                let rank = s.len();
+                let mut shape = vec![1usize; rank];
+                shape[1] = c_out;
+                shape
+            }
+            _ => continue,
+        };
+
+        // Compute factor = scale / sqrt(var + eps)  and  shift = bias - mean * factor
+        let mut factor_data = Vec::with_capacity(c_out);
+        let mut shift_data = Vec::with_capacity(c_out);
+        for c in 0..c_out {
+            let inv_std = 1.0 / (bn_var.data[c] + epsilon).sqrt();
+            let f = bn_scale.data[c] * inv_std;
+            factor_data.push(f);
+            shift_data.push(bn_bias.data[c] - bn_mean.data[c] * f);
+        }
+
+        // Generated tensor names are keyed on the (spec-unique) BatchNorm
+        // output name — `Node::name` may be empty or duplicated, which would
+        // make two folds collide on one `weights` entry.
+        let name_base = match node.outputs.first() {
+            Some(name) if !name.is_empty() => name.clone(),
+            _ => continue,
+        };
+        let factor_name = names.allocate(&name_base, "_bn_factor");
+        let shift_name = names.allocate(&name_base, "_bn_shift");
+        let mul_out_name = names.allocate(&name_base, "_bn_mul_out");
+
+        weights.insert(
+            factor_name.clone(),
+            Tensor::new(factor_data, bn_const_shape.clone()),
+        );
+        weights.insert(shift_name.clone(), Tensor::new(shift_data, bn_const_shape));
+
+        // Emit Mul(X, factor) → Add(mul_out, shift)
+        let mul_node = Node {
+            op: OpKind::Mul,
+            name: format!("{}_bn_mul", node.name),
+            inputs: vec![x_name.clone(), factor_name],
+            outputs: vec![mul_out_name.clone()],
+            attrs: Attributes::default(),
+        };
+        let add_node = Node {
+            op: OpKind::Add,
+            name: format!("{}_bn_add", node.name),
+            inputs: vec![mul_out_name, shift_name],
+            outputs: node.outputs.clone(),
+            attrs: Attributes::default(),
+        };
+
+        skip.insert(i);
+        new_nodes.push((i, vec![mul_node, add_node]));
+    }
+
+    // Build result: replace skipped BN nodes with their Mul+Add replacements
+    let mut result = Vec::with_capacity(nodes.len() + new_nodes.len());
+    let replacement_map: HashMap<usize, Vec<Node>> = new_nodes.into_iter().collect();
+
+    for (i, node) in nodes.into_iter().enumerate() {
+        if let Some(replacement_nodes) = replacement_map.get(&i) {
+            result.extend(replacement_nodes.iter().cloned());
+        } else if !skip.contains(&i) {
+            result.push(node);
+        }
+    }
+
+    result
+}

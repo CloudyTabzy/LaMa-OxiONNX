@@ -1,0 +1,35 @@
+[package]
+name = "lama-worker-oxionnx"
+version = "0.1.0"
+edition = "2021"
+rust-version = "1.75"
+description = "LaMa inpainting sidecar worker (pure Rust, OxiONNX backend)"
+license = "Apache-2.0"
+
+[dependencies]
+# OxiONNX is vendored in-tree at `vendor/oxionnx` (Apache-2.0, upstream
+# 0.1.7) and carries this project's performance patches. See
+# `vendor/oxionnx/MODIFICATIONS.md` for the change list and
+# `vendor/oxionnx/LICENSE` for the upstream licence.
+#
+# The `simd` feature is **required**, not optional: the fork's AVX2
+# kernels are `unsafe` and the crate denies `unsafe_code` without it.
+# It also enables AVX2 im2col and elementwise ops. The worker's target
+# is x86_64 with AVX2 (runtime-detected; scalar fallbacks exist).
+#
+# To also enable AVX2 codegen for the non-SIMD code paths (LLVM
+# auto-vectorization), build with:
+#   RUSTFLAGS="-C target-cpu=x86-64-v3" cargo build --release
+oxionnx = { path = "vendor/oxionnx", features = ["simd"] }
+
+# PNG I/O
+image = { version = "0.25", default-features = false, features = ["png"] }
+
+# Numpy equivalent
+ndarray = { version = "0.17", default-features = false }
+
+# CLI parsing
+clap = { version = "4", default-features = false, features = ["std", "derive", "help"] }
+
+anyhow = "1"
+matrixmultiply = "0.3"
