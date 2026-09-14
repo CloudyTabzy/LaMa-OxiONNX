@@ -38,6 +38,7 @@ then restart GIMP and use **Filters → Enhance → LaMa Inpaint (OxiONNX)...**.
 | `LAMA_OXIONNX_WORKER` | run a development worker build instead of the installed one |
 | `LAMA_OXIONNX_DEBUG_DIR` | keep copies of the exchanged `image.png` / `mask.png` / `result.png` |
 | `LAMA_OXIONNX_MAX_PIXELS` | override the 4 MP native-resolution guard (default 4,000,000) |
+| `OXIONNX_SESSION_CACHE=1` | enable the worker's optional ~373 MB session cache (set before GIMP starts; the worker inherits it — off by default, saves ~0.1 s/run) |
 
 ## Log and per-run profiling
 
@@ -52,7 +53,9 @@ round trip:
 ```
 
 - **worker** (inside the Rust process): PNG decode, preprocessing, session
-  load (the OxiCache), inference (`run_ms`), output compose, PNG write.
+  load (only when the optional cache is enabled — off by default, so this is
+  the model parse + optimize cost), inference (`run_ms`), output compose,
+  PNG write.
 - **bridge** (inside GIMP): drawable export through GEGL, selection-mask
   export, the worker's full wall time (spawn → exit), result import into the
   shadow buffer, and shadow merge + `displays_flush`.

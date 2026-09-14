@@ -1,0 +1,56 @@
+name: Release
+
+on:
+  push:
+    tags: ["v*"]
+  workflow_dispatch:
+
+permissions:
+  contents: write
+
+jobs:
+  windows-x64:
+    runs-on: windows-latest
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v4
+
+      - name: Rust toolchain
+        uses: dtolnay/rust-toolchain@stable
+
+      - name: Build worker (release)
+        run: cargo build --release
+
+      - name: Engine test suite
+        working-directory: vendor/oxionnx
+        run: cargo test --release --features simd
+
+      - name: Assemble GIMP plug-in bundle
+        shell: pwsh
+        run: |
+          $tag = $env:GITHUB_REF_NAME
+          $stage = "stage/lama-oxionnx"
+          New-Item -ItemType Directory -Force -Path $stage | Out-Null
+          Copy-Item gimp/install.bat          $stage
+          Copy-Item gimp/lama-oxionnx.py      $stage
+          Copy-Item gimp/gimp-verbose.bat     $stage
+          Copy-Item gimp/INSTALL.txt          $stage
+          Copy-Item LICENSE                   $stage
+          Copy-Item target/release/lama-worker-oxionnx.exe $stage
+          $zip = "lama-oxionnx-$tag-win64.zip"
+          Compress-Archive -Path "$stage/*" -DestinationPath $zip
+          $hash = (Get-FileHash $zip -Algorithm SHA256).Hash.ToLower()
+          "lama-oxionnx-$tag-win64.zip  $hash" | Set-Content -Encoding ascii SHA256SUMS.txt
+          Write-Host "built $zip  sha256=$hash"
+
+      - name: Create GitHub release
+        shell: pwsh
+        env:
+          GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+        run: |
+          $tag = $env:GITHUB_REF_NAME
+          gh release create $tag `
+            "lama-oxionnx-$tag-win64.zip" `
+            "SHA256SUMS.txt" `
+            --title "LaMa OxiONNX $tag" `
+            --generate-notes

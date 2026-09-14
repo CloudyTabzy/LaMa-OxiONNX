@@ -52,7 +52,9 @@ target\release\lama-worker-oxionnx.exe ^
 ```
 
 `OXIONNX_OPT_LEVEL=none` keeps node boundaries identical to the ORT run;
-`OXIONNX_NO_SESSION_CACHE=1` stops a cached graph from being loaded instead.
+the session cache is off by default — if you enabled it with
+`OXIONNX_SESSION_CACHE=1`, set `OXIONNX_NO_SESSION_CACHE=1` here so no
+cached graph is loaded instead.
 
 **3. Compare:**
 

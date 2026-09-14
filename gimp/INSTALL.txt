@@ -1,0 +1,35 @@
+LaMa OxiONNX - GIMP 3.2 plug-in (Windows x64)
+=============================================
+
+1. Keep these files together in one folder:
+     install.bat   lama-oxionnx.py   lama-worker-oxionnx.exe
+     gimp-verbose.bat   LICENSE
+2. Double-click install.bat.
+     - copies the plug-in into %APPDATA%\GIMP\3.2\plug-ins\lama-oxionnx\
+     - writes the per-user GIMP interpreter alias (nothing in the GIMP
+       installation itself is touched)
+     - installs the LaMa model: from this folder if present, from an
+       existing "lama-inpaint" plug-in install, or by downloading it
+3. Restart GIMP, then run  Filters -> Enhance -> LaMa Inpaint (OxiONNX)...
+
+Requirements
+  - GIMP 3.2 (64-bit), Windows x64.
+  - No Python packages, no ONNX Runtime, no Rust toolchain: the worker is a
+    single statically linked Rust binary. AVX2/FMA are used when available;
+    scalar fallbacks exist for older x86-64 CPUs.
+  - The model (~198 MB) is downloaded automatically on first install.
+    SHA-256: aacebdf7ced83c4863d7900ed61292224fc718acece717ce2d25630bf44ed584
+
+Notes
+  - Installs side by side with the ONNX Runtime plug-in
+    (plug-ins\lama-inpaint); both entries can be compared in one GIMP
+    session.
+  - No session cache is used by default. Setting OXIONNX_SESSION_CACHE=1
+    enables a ~373 MB cache next to the model that saves about 0.1 s per
+    run; it is not needed.
+  - Status log with a per-run phase profile (export / worker / inference /
+    import / apply):
+      %APPDATA%\GIMP\3.2\plug-ins\lama-oxionnx\lama.log
+  - Uninstall: delete %APPDATA%\GIMP\3.2\plug-ins\lama-oxionnx\ and the
+    lama-oxionnx-gimp-python*.interp files under
+    %APPDATA%\GIMP\3.2\interpreters\.

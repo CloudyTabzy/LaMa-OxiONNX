@@ -8,11 +8,11 @@ REM What this installer does (no Python worker, no ML wheels):
 REM   1. Creates the user-level GIMP interpreter alias for the plug-in
 REM      shebang (never touches GIMP's installation files).
 REM   2. Copies the GIMP-side bridge (lama-oxionnx.py) into the plug-in dir.
-REM   3. Installs the LaMa model: copies it from this repo, from the
+REM   3. Installs the LaMa model: copies it from this folder, from the
 REM      existing ONNX Runtime plug-in install, or downloads it.
-REM   4. Builds the pure-Rust OxiONNX worker with cargo and copies it
-REM      next to the plug-in (plus the prebuilt session cache when one is
-REM      available, so the first run does not have to build it).
+REM   4. Installs the pure-Rust OxiONNX worker: uses the prebuilt binary
+REM      next to this script when present (release bundle), otherwise
+REM      builds it from source with cargo (repository checkout).
 REM
 REM The plug-in installs side by side with the ONNX Runtime plug-in
 REM (plug-ins\lama-inpaint): own procedure, own menu entry, own folder.
@@ -79,8 +79,7 @@ copy /Y "%SRC%lama-oxionnx.py" "%DEST%\lama-oxionnx.py" >nul || goto :copy_faile
 
 REM --- 3. LaMa model (dynamic-H/W export) ---
 set "MODEL_DEST=%DEST%\lama_fp32.onnx"
-set "MODEL_URL=https://github.com/CloudyTabzy/Gimp-lama-inpainting/releases/download/v1.1.0/lama_fp32.onnx"
-set "CACHE_DEST=%DEST%\lama_fp32.onnx.r1.oxicache"
+set "MODEL_URL=https://github.com/CloudyTabzy/LaMa-OxiONNX/releases/download/model-lama-fp32-v1/lama_fp32.onnx"
 
 if exist "%MODEL_DEST%" (
     echo Model: already present
@@ -103,15 +102,6 @@ echo Copying LaMa model from:
 echo   %MODEL_SRC_DIR%lama_fp32.onnx
 copy /Y "%MODEL_SRC_DIR%lama_fp32.onnx" "%MODEL_DEST%" >nul || goto :model_copy_failed
 set "MODEL_STATUS=copied"
-if not exist "%MODEL_SRC_DIR%lama_fp32.onnx.r1.oxicache" goto :model_ready
-if exist "%CACHE_DEST%" goto :model_ready
-echo Copying the prebuilt OxiONNX session cache, about 373 MB...
-copy /Y "%MODEL_SRC_DIR%lama_fp32.onnx.r1.oxicache" "%CACHE_DEST%" >nul
-if errorlevel 1 (
-    echo NOTE: cache copy failed. The worker will rebuild it on first run.
-) else (
-    echo Cache copied. The first inference will be fast.
-)
 goto :model_ready
 
 :model_download
@@ -216,9 +206,9 @@ echo Restart GIMP, then use Filters ^> Enhance ^> LaMa Inpaint (OxiONNX)...
 echo This is a separate entry from the ONNX Runtime plug-in; both can be
 echo installed and compared side by side.
 echo.
-echo The first inference builds the OxiONNX session cache next to the model
-echo when one was not copied, taking about two minutes and ~373 MB. Later
-echo runs load the cache in under a second.
+echo Optional: set OXIONNX_SESSION_CACHE=1 in the environment to enable a
+echo ~373 MB startup cache next to the model (saves about 0.1 s per run;
+echo not needed - the worker parses and optimizes the model on the spot).
 endlocal
 exit /b 0
 

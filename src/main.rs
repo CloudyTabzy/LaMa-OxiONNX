@@ -147,10 +147,14 @@ fn run_inpaint(args: &Args) -> Result<()> {
     let profile = std::env::var("OXIONNX_PROFILE").ok().as_deref()
         .map_or(false, |v| !matches!(v, "" | "0" | "false" | "no" | "off"));
 
-    // Session cache: parsing the 198 MB ONNX protobuf costs several hundred
-    // milliseconds per run. `save_optimized`/`load_optimized` persist the
+    // Session cache (opt-in): parsing the 198 MB ONNX protobuf costs over a
+    // second per run. `save_optimized`/`load_optimized` persist the
     // already-optimized graph + weights, skipping protobuf decode and every
-    // optimization pass.
+    // optimization pass — at the cost of a ~373 MB cache file next to the
+    // model. It is **not used unless asked for**: set
+    // `OXIONNX_SESSION_CACHE=1` to enable it. Nothing depends on it: a
+    // missing, stale or unreadable cache simply means the model is parsed and
+    // optimized on the spot.
     //
     // Validity has two independent parts:
     //   * the **model** must not have changed (size + mtime, below);
@@ -160,12 +164,19 @@ fn run_inpaint(args: &Args) -> Result<()> {
     //     in-place binary upgrade silently kept running the pre-upgrade graph
     //     (we hit exactly this when the fusion passes landed), which is a
     //     correctness-shaped failure, not merely a slow one.
-    let use_cache = std::env::var("OXIONNX_NO_SESSION_CACHE").ok().as_deref()
-        .map_or(true, |v| matches!(v, "" | "0" | "false" | "no" | "off"));
+    let env_truthy = |name: &str| {
+        std::env::var(name)
+            .ok()
+            .as_deref()
+            .map_or(false, |v| !matches!(v, "" | "0" | "false" | "no" | "off"))
+    };
+    let use_cache = env_truthy("OXIONNX_SESSION_CACHE") && !env_truthy("OXIONNX_NO_SESSION_CACHE");
 
     // QA knob: force a graph-optimization level (`OXIONNX_OPT_LEVEL` =
-    // none|basic|extended|all) to bisect optimizer-related numerics. Pair it
-    // with `OXIONNX_NO_SESSION_CACHE=1`, otherwise the cached graph wins.
+    // none|basic|extended|all) to bisect optimizer-related numerics. Keep the
+    // session cache disabled (the default; if you enabled it with
+    // `OXIONNX_SESSION_CACHE=1`, turn it off for the test), otherwise the
+    // cached graph wins.
     let opt_level = match std::env::var("OXIONNX_OPT_LEVEL").ok().as_deref() {
         Some("none") => Some(OptLevel::None),
         Some("basic") => Some(OptLevel::Basic),

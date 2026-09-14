@@ -18,9 +18,9 @@ faster than the ONNX Runtime worker, with output that matches ONNX Runtime
 
 ## Highlights
 
-- **~2x faster than ONNX Runtime** on the same machine, same model
-  (interleaved A/B: 7.40 s → 3.75 s for 512×512 with the final optimisation
-  pass, 1.97x; 1.92x before it).
+- **~1.8–2x faster than ONNX Runtime** on the same machine, same model
+  (interleaved A/B at 512×512: 7.40 s → **~4.2 s** out of the box,
+  **3.75 s** with the optional session cache enabled — 1.97x).
 - **Installable GIMP plug-in** — [`gimp/install.bat`](gimp) deploys
   `plug-in-lama-oxionnx` side by side with the ONNX Runtime plug-in;
   verified end to end through GIMP's batch mode (worker spawn, cache load,
@@ -63,28 +63,38 @@ this plug-in uses its own procedure name, menu entry, and install directory,
 
 ## 🧩 Install as a GIMP plug-in (Windows)
 
+**Option A — prebuilt release (recommended).** Download
+`lama-oxionnx-vX.Y.Z-win64.zip` from
+[Releases](https://github.com/CloudyTabzy/LaMa-OxiONNX/releases), unzip it,
+and run `install.bat`. No Rust toolchain, no Python packages, no ONNX
+Runtime — just GIMP 3.2.
+
+**Option B — from source.** Requires Rust 1.94+:
+
 ```bat
-git clone <this repository>
+git clone https://github.com/CloudyTabzy/LaMa-OxiONNX
 cd LaMa-OxiONNX\gimp
 install.bat
 ```
 
-The installer needs only GIMP 3.2 and Rust 1.94+ (`cargo`). It:
+Either way the installer:
 
 1. writes the per-user `.interp` alias for the plug-in shebang
    (never touches GIMP's installation files),
 2. copies `lama-oxionnx.py` to `%APPDATA%\GIMP\3.2\plug-ins\lama-oxionnx\`,
 3. installs the LaMa model — copied from `gimp\lama_fp32.onnx` if present,
    else from the existing ONNX Runtime plug-in install
-   (`plug-ins\lama-inpaint`), else downloaded from the v1.1.0 release
-   (~200 MB), together with the prebuilt session cache when available,
-4. runs `cargo build --release` and copies `lama-worker-oxionnx.exe` next to
-   the plug-in.
+   (`plug-ins\lama-inpaint`), else downloaded from this repository's
+   [model release](https://github.com/CloudyTabzy/LaMa-OxiONNX/releases/tag/model-lama-fp32-v1)
+   (~198 MB, dynamic H/W),
+4. installs `lama-worker-oxionnx.exe` — the prebuilt binary from the release
+   bundle, or built from source with `cargo build --release`.
 
 Restart GIMP, make a selection, and run
-**Filters → Enhance → LaMa Inpaint (OxiONNX)...**. The first inference
-builds the OxiONNX session cache (~373 MB, a few seconds) if the prebuilt one
-was not available; later runs load it in under a second. Status is logged to
+**Filters → Enhance → LaMa Inpaint (OxiONNX)...**. No session cache is used
+by default: the model is parsed and optimized on the spot (~0.4 s; the
+optional `OXIONNX_SESSION_CACHE=1` cache saves only ~0.1 s for 373 MB of
+disk, so most users should skip it). Status is logged to
 `plug-ins\lama-oxionnx\lama.log`, with a per-run phase profile (drawable
 export, worker wall time, inference, result import, shadow merge) — see
 [gimp/README.md](gimp/README.md#log-and-per-run-profiling).
@@ -121,7 +131,13 @@ results by ±20%, so alternating measurements are the only fair comparison):
 `512×512 input · Intel i7-13620H · Rust 1.94 · same model file`
 
 Re-measured after the final layout/slot pass (arc below): **ORT 7.40 s →
-OxiONNX 3.75 s (1.97x)** — three interleaved rounds on the same fixture.
+OxiONNX 3.75 s (1.97x)**, three interleaved rounds on the same fixture.
+
+Both tables above ran with `OXIONNX_SESSION_CACHE=1`, which was the default
+at the time. The cache is opt-in now; with it off, add the model's
+parse + optimize time (~0.4 s): **7.40 s → ≈4.2 s, about 1.75x** — the cache
+buys only ~0.1 s in practice, which is why it is no longer the default and
+is not part of any release bundle.
 
 ### Binary size
 
@@ -204,9 +220,9 @@ these by ±20%; parallel node time sums above the ~3.5 s wall clock):
   kill switches (`OXIONNX_NO_ADDBN_FUSION`, `OXIONNX_NO_SCRATCH_CACHE`,
   `OXIONNX_NO_SESSION_CACHE`, `OXIONNX_OPT_LEVEL`) so any behaviour can be
   turned off and re-measured in the same binary.
-- **Session-cache integrity**: cache file names embed a revision plus the
-  model's size/mtime, and are written atomically — a stale or truncated cache
-  is never loaded.
+- **Session-cache integrity** (the cache is opt-in): when enabled, cache
+  file names embed a revision plus the model's size/mtime, and are written
+  atomically — a stale or truncated cache is never loaded.
 
 ## 🧭 Roadmap
 
@@ -231,11 +247,13 @@ these by ±20%; parallel node time sums above the ~3.5 s wall clock):
 .
 ├── Cargo.toml / Cargo.lock     worker crate (path-deps vendor/oxionnx)
 ├── LICENSE                     Apache-2.0
+├── .github/workflows/          release pipeline (build, test, bundle, publish)
 ├── src/
-│   ├── main.rs                 the worker: CLI, image IO, pre/post, cache
+│   ├── main.rs                 the worker: CLI, image IO, pre/post, optional cache
 │   └── bin/bench_gemm.rs       GEMM microbenchmark used during profiling
 ├── gimp/                       the GIMP front-end (Python bridge + installer)
 │   ├── README.md               bridge docs, debugging, headless GIMP recipe
+│   ├── INSTALL.txt             end-user install notes (shipped in release zips)
 │   ├── lama-oxionnx.py         plug-in: GEGL glue, worker spawn, shadow buffer
 │   ├── install.bat             per-user installer (interpreter alias, model, worker)
 │   └── gimp-verbose.bat        launch GIMP with a console + show the log
@@ -247,7 +265,8 @@ these by ±20%; parallel node time sums above the ~3.5 s wall clock):
 ├── docs/
 │   ├── OXIONNX_REPORT.md       evaluation + optimisation + correctness audit (§10)
 │   ├── ORT_STRATEGIES.md       audit of onnxruntime-main: adopted / rejected / v2
-│   └── GIMP_NOTES.md           GIMP-side lessons (adopted from the ORT plug-in repo)
+│   ├── GIMP_NOTES.md           GIMP-side lessons (adopted from the ORT plug-in repo)
+│   └── RELEASING.md            how releases and the model asset are cut
 └── test_data/                  six input fixtures (generated outputs gitignored)
 ```
 
@@ -272,10 +291,10 @@ Optional environment switches, all off by default:
 | Variable | Effect |
 |---|---|
 | `OXIONNX_PROFILE=1` | per-node timing dump (top 50 + totals by op) and `profile_all_nodes.csv` |
-| `OXIONNX_NO_SESSION_CACHE=1` | disable the `save_optimized` session cache |
+| `OXIONNX_SESSION_CACHE=1` | opt in to the ~373 MB session cache (saves ~0.1 s/run; not needed — `OXIONNX_NO_SESSION_CACHE=1` forces it off) |
 | `OXIONNX_NO_ADDBN_FUSION=1` | disable the `fuse_add_batchnorm` graph fold |
 | `OXIONNX_NO_SCRATCH_CACHE=1` | allocate a fresh im2col buffer per convolution |
-| `OXIONNX_OPT_LEVEL=none\|basic\|extended\|all` | force a graph optimisation level (pair with `OXIONNX_NO_SESSION_CACHE=1`); used for numerical bisection |
+| `OXIONNX_OPT_LEVEL=none\|basic\|extended\|all` | force a graph optimisation level (keep the session cache off — the default); used for numerical bisection |
 | `LAMA_OXIONNX_DUMP_TAPS=<dir>` | dump every graph output as raw f32 + shape (used with a tap-augmented model for the ORT differential harness) |
 
 Two more switches live in the GIMP bridge (`gimp/lama-oxionnx.py`):
